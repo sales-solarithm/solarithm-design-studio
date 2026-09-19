@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-playfair), ui-serif, Georgia, serif;
+  
+  --color-solarithm-gold: #D4AF37;
+  --color-solarithm-gold-light: #FDF6E3;
+  --color-solarithm-brown: #4A3728;
+  --color-solarithm-brown-light: #8B6B4A;
+  --color-solarithm-dark: #1A1A1A;
+  --color-solarithm-darker: #121212;
+  --color-solarithm-card: #1E1E1E;
+
+  --color-gold: #D4AF37;
+  --color-gold-light: #E5C765;
+  --color-brown: #4A3728;
+  --color-brown-light: #6A5340;
+  --color-black: #1A1A1A;
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+body {
+  @apply bg-gray-50 dark:bg-[#121212] text-gray-900 dark:text-gray-200 transition-colors duration-200;
+}

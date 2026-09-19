@@ -1,0 +1,6 @@
+{
+  "name": "Solarithm Designer's Project Sheet",
+  "description": "Distraction-free workspace for designers to view their assigned projects and update their progress.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

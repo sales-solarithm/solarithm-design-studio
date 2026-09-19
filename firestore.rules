@@ -1,0 +1,67 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Core Master Operational Collections
+    match /approvals/{approvalId} {
+      allow read, write: if true;
+    }
+
+    match /employees/{employeeId} {
+      allow read, write: if true;
+    }
+
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    match /registeredApps/{appId} {
+      allow read, write: if true;
+    }
+
+    match /auditLogs/{logId} {
+      allow read, write: if true;
+    }
+
+    // Solarithm Engineering & Project Collections
+    match /projects/{projectId} {
+      allow read, write: if true;
+    }
+    
+    match /clients/{clientId} {
+      allow read, write: if true;
+    }
+
+    match /changeRequests/{requestId} {
+      allow read, write: if true;
+    }
+
+    match /designApprovals/{approvalId} {
+      allow read, write: if true;
+    }
+
+    match /scopes/{scopeId} {
+      allow read, write: if true;
+    }
+
+    match /pricingRules/{ruleId} {
+      allow read, write: if true;
+    }
+
+    match /apps/{appId} {
+      allow read, write: if true;
+    }
+
+    match /appRegistry/{registryId} {
+      allow read, write: if true;
+    }
+
+    match /proposals/{proposalId} {
+      allow read, write: if true;
+    }
+
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

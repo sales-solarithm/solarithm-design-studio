@@ -1,0 +1,194 @@
+{
+  "$schema": "https://raw.githubusercontent.com/firebase/firebase-tools/master/schema/firebase-blueprint.json",
+  "version": 1,
+  "collections": [
+    {
+      "name": "approvals",
+      "description": "Primary queue for authentication exceptions and password reset requests",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "type", "type": "string" },
+        { "name": "requestedEmail", "type": "string" },
+        { "name": "email", "type": "string" },
+        { "name": "appName", "type": "string" },
+        { "name": "appId", "type": "string" },
+        { "name": "employeeName", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "employeeId", "type": "string" },
+        { "name": "reason", "type": "string" },
+        { "name": "status", "type": "string" },
+        { "name": "timestamp", "type": "string" },
+        { "name": "tempPassword", "type": "string" },
+        { "name": "resolvedAt", "type": "string" },
+        { "name": "resolvedBy", "type": "string" }
+      ],
+      "indexes": [
+        {
+          "fields": ["type", "status"],
+          "queryModes": ["filter", "sort"]
+        }
+      ]
+    },
+    {
+      "name": "employees",
+      "description": "Central company directory and KYC record store",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "email", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "phone", "type": "string" },
+        { "name": "department", "type": "string" },
+        { "name": "designation", "type": "string" },
+        { "name": "role", "type": "string" },
+        { "name": "employeeId", "type": "string" },
+        { "name": "dateOfJoining", "type": "string" },
+        { "name": "dateOfBirth", "type": "string" },
+        { "name": "bankName", "type": "string" },
+        { "name": "accountNumber", "type": "string" },
+        { "name": "ifscCode", "type": "string" },
+        { "name": "panCardNumber", "type": "string" },
+        { "name": "aadhaarCardNumber", "type": "string" },
+        { "name": "houseAddress", "type": "string" },
+        { "name": "personalEmailAddress", "type": "string" },
+        { "name": "createdAt", "type": "string" },
+        { "name": "updatedAt", "type": "string" }
+      ],
+      "indexes": [
+        {
+          "fields": ["email"],
+          "queryModes": ["filter"]
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "description": "Mirrored credential and authentication profile store",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "email", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "role", "type": "string" },
+        { "name": "assignedRole", "type": "string" },
+        { "name": "department", "type": "string" },
+        { "name": "designation", "type": "string" }
+      ],
+      "indexes": [
+        {
+          "fields": ["email"],
+          "queryModes": ["filter"]
+        }
+      ]
+    },
+    {
+      "name": "registeredApps",
+      "description": "App registry for accessible ecosystem applications",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "name", "type": "string" },
+        { "name": "url", "type": "string" },
+        { "name": "description", "type": "string" },
+        { "name": "icon", "type": "string" },
+        { "name": "category", "type": "string" },
+        { "name": "active", "type": "boolean" },
+        { "name": "allowedRoles", "type": "array" },
+        { "name": "createdAt", "type": "string" }
+      ]
+    },
+    {
+      "name": "auditLogs",
+      "description": "Centralized compliance and telemetry record of administrative actions",
+      "accessModes": ["create", "read"],
+      "fields": [
+        { "name": "action", "type": "string" },
+        { "name": "actor", "type": "string" },
+        { "name": "target", "type": "string" },
+        { "name": "details", "type": "object" },
+        { "name": "timestamp", "type": "timestamp" }
+      ]
+    },
+    {
+      "name": "projects",
+      "description": "Projects assigned to designers",
+      "accessModes": ["create", "read", "update", "delete"],
+      "fields": [
+        { "name": "srNumber", "type": "string" },
+        { "name": "projectName", "type": "string" },
+        { "name": "clientName", "type": "string" },
+        { "name": "scopeOfWork", "type": "string" },
+        { "name": "plantCapacityKw", "type": ["number", "string", "null"] },
+        { "name": "projectDate", "type": "string" },
+        { "name": "salesPerson", "type": "string" },
+        { "name": "designerEmail", "type": "string" },
+        { "name": "status", "type": "string" },
+        { "name": "updatedAt", "type": "timestamp" }
+      ],
+      "indexes": [
+        {
+          "fields": ["designerEmail", "updatedAt"],
+          "queryModes": ["filter", "sort"]
+        }
+      ]
+    },
+    {
+      "name": "changeRequests",
+      "description": "Change requests submitted by designers for project details",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "projectId", "type": "string" },
+        { "name": "projectNumber", "type": "string" },
+        { "name": "clientName", "type": "string" },
+        { "name": "fieldToChange", "type": "string" },
+        { "name": "currentValue", "type": ["string", "number", "null"] },
+        { "name": "requestedValue", "type": ["string", "number", "null"] },
+        { "name": "reason", "type": "string" },
+        { "name": "requestedBy", "type": "string" },
+        { "name": "status", "type": "string" },
+        { "name": "createdAt", "type": "timestamp" }
+      ],
+      "indexes": [
+        {
+          "fields": ["requestedBy", "createdAt"],
+          "queryModes": ["filter", "sort"]
+        }
+      ]
+    },
+    {
+      "name": "clients",
+      "description": "Clients directory",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "clientName", "type": "string" },
+        { "name": "contactPerson", "type": "string" },
+        { "name": "email", "type": "string" },
+        { "name": "phone", "type": "string" }
+      ]
+    },
+    {
+      "name": "scopes",
+      "description": "Project scopes and sub-services",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "name", "type": "string" },
+        { "name": "subServices", "type": "array" }
+      ]
+    },
+    {
+      "name": "pricingRules",
+      "description": "Central pricing rules",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "category", "type": "string" },
+        { "name": "capacityRows", "type": "array" }
+      ]
+    },
+    {
+      "name": "proposals",
+      "description": "Proposals collection",
+      "accessModes": ["create", "read", "update"],
+      "fields": [
+        { "name": "proposalNumber", "type": "string" },
+        { "name": "clientName", "type": "string" }
+      ]
+    }
+  ]
+}
