@@ -7,6 +7,9 @@ import { db } from "@/lib/firebase";
 import {
   SUPER_ADMIN_EMAILS,
   ALLOWED_ROLES,
+  DESIGN_STUDIO_APP_ID,
+  checkHasDesignStudioAccess,
+  clearStoredEnterpriseAuth,
   useAuth
 } from "@/components/AuthGuard";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -28,8 +31,8 @@ export default function LoginPage() {
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanEmail = email.toLowerCase().trim();
-    if (!cleanEmail) {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) {
       setError("Please enter your corporate email address.");
       return;
     }
@@ -39,17 +42,18 @@ export default function LoginPage() {
 
     try {
       // 1. Owner / Super Admin bypass check
-      const isOwner = SUPER_ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(cleanEmail);
+      const isOwner = SUPER_ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(normalizedEmail);
       if (isOwner) {
-        login(cleanEmail, "owner");
+        login(normalizedEmail, "owner");
         try {
           await addDoc(collection(db, "auditLogs"), {
             action: "DESIGNER_LOGIN",
-            actor: cleanEmail,
-            target: cleanEmail,
+            actor: normalizedEmail,
+            target: normalizedEmail,
             details: {
               role: "owner",
-              app: "Solarithm Designer's Project Sheet"
+              app: "Solarithm Design Studio",
+              appId: DESIGN_STUDIO_APP_ID
             },
             timestamp: new Date().toISOString()
           });
@@ -58,89 +62,62 @@ export default function LoginPage() {
         return;
       }
 
-      // 2. Query 'employees' collection in Master Database Hub
-      let found = false;
-      let detectedRole = "";
+      // 2. Query 'users' collection in Admin Console
+      const usersQuery = query(
+        collection(db, "users"),
+        where("email", "==", normalizedEmail)
+      );
+      const querySnapshot = await getDocs(usersQuery);
 
-      try {
-        const empQuery = query(
-          collection(db, "employees"),
-          where("email", "==", cleanEmail)
-        );
-        const empSnap = await getDocs(empQuery);
-        if (!empSnap.empty) {
-          found = true;
-          const empData = empSnap.docs[0].data();
-          const rawRole = (empData.role || empData.assignedRole || "").toLowerCase().trim();
-          const dept = (empData.department || "").toLowerCase();
-          const desig = (empData.designation || "").toLowerCase();
-
-          if (rawRole === "owner" || rawRole === "admin") {
-            detectedRole = rawRole;
-          } else if (
-            rawRole.includes("design") ||
-            rawRole.includes("engineer") ||
-            rawRole.includes("architect") ||
-            dept.includes("design") ||
-            dept.includes("engineer") ||
-            desig.includes("design") ||
-            desig.includes("engineer") ||
-            desig.includes("architect")
-          ) {
-            detectedRole = "designer";
-          } else if (rawRole) {
-            detectedRole = rawRole;
-          } else {
-            detectedRole = "designer";
-          }
-        }
-      } catch (empErr) {
-        console.warn("Could not query employees collection:", empErr);
-      }
-
-      // 3. Fallback: Query 'users' collection
-      if (!found) {
-        try {
-          const usersQuery = query(
-            collection(db, "users"),
-            where("email", "==", cleanEmail)
-          );
-          const userSnap = await getDocs(usersQuery);
-          if (!userSnap.empty) {
-            found = true;
-            const userData = userSnap.docs[0].data();
-            detectedRole = (userData.role || userData.assignedRole || "designer").toLowerCase().trim();
-          }
-        } catch (userErr) {
-          console.warn("Could not query users collection:", userErr);
-        }
-      }
-
-      if (!found) {
-        setError(`Access Denied: The email "${cleanEmail}" was not found in the employee directory or authorized roster. Please contact your system administrator.`);
+      if (querySnapshot.empty) {
+        clearStoredEnterpriseAuth();
+        setError(`Access Denied: The email "${normalizedEmail}" was not found in the authorized user roster. Please contact your system administrator.`);
         setLoading(false);
         return;
       }
 
-      const normalizedRole = detectedRole.toLowerCase().trim();
-      if (!ALLOWED_ROLES.includes(normalizedRole) && normalizedRole !== "") {
-        setError(`Access Denied: Your account (${cleanEmail}) does not have authorized Designer, Admin, or Engineering permissions.`);
+      // 3. Strict affirmative check for Design Studio access in accessibleApps
+      const userDoc = querySnapshot.docs[0]?.data();
+      const accessibleApps: string[] = Array.isArray(userDoc?.accessibleApps) ? userDoc.accessibleApps : [];
+
+      const hasAccess =
+        accessibleApps.includes(DESIGN_STUDIO_APP_ID) ||
+        accessibleApps.includes("design_studio") ||
+        accessibleApps.includes("solarithm_design_studio") ||
+        accessibleApps.includes("design-studio") ||
+        checkHasDesignStudioAccess(accessibleApps);
+
+      if (!hasAccess) {
+        // Deny entry immediately
+        clearStoredEnterpriseAuth();
+        setError("Access Denied: You do not have permission to access Design Studio.");
         setLoading(false);
         return;
       }
 
-      const finalRole = normalizedRole === "owner" || normalizedRole === "admin" ? normalizedRole : "designer";
-      login(cleanEmail, finalRole);
+      // 4. Role validation
+      const rawRole = (userDoc?.role || userDoc?.assignedRole || "designer").toLowerCase().trim();
+      if (!ALLOWED_ROLES.includes(rawRole) && rawRole !== "") {
+        clearStoredEnterpriseAuth();
+        setError(`Access Denied: Your account (${normalizedEmail}) does not have authorized Designer, Admin, or Engineering permissions.`);
+        setLoading(false);
+        return;
+      }
+
+      const finalRole = rawRole === "owner" || rawRole === "admin" ? rawRole : "designer";
+      login(normalizedEmail, finalRole);
 
       // Audit Log for secure login event
       try {
         await addDoc(collection(db, "auditLogs"), {
           action: "DESIGNER_LOGIN",
-          actor: cleanEmail,
-          target: cleanEmail,
+          actor: normalizedEmail,
+          target: normalizedEmail,
           details: {
             role: finalRole,
-            app: "Solarithm Designer's Project Sheet"
+            app: "Solarithm Design Studio",
+            appId: DESIGN_STUDIO_APP_ID,
+            accessibleApps
           },
           timestamp: new Date().toISOString()
         });
@@ -149,6 +126,7 @@ export default function LoginPage() {
       router.replace("/");
     } catch (err: any) {
       console.error("Login verification error:", err);
+      clearStoredEnterpriseAuth();
       setError(err.message || "Failed to verify employee credentials. Please check your connection.");
     } finally {
       setLoading(false);

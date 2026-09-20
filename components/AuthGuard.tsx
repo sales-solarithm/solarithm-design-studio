@@ -14,6 +14,24 @@ export const SUPER_ADMIN_EMAILS = [
 
 export const ALLOWED_ROLES = ["designer", "design", "engineer", "admin", "owner", "architect", "employee"];
 
+export const DESIGN_STUDIO_APP_ID = "solarithm-design-studio";
+export const DESIGN_STUDIO_APP_IDS = [
+  "solarithm-design-studio",
+  "solarithm_design_studio",
+  "design_studio",
+  "design-studio"
+];
+
+export const checkHasDesignStudioAccess = (accessibleApps?: string[] | null): boolean => {
+  if (!Array.isArray(accessibleApps)) return false;
+  return accessibleApps.some((appId) =>
+    typeof appId === "string" && (
+      DESIGN_STUDIO_APP_IDS.includes(appId) ||
+      DESIGN_STUDIO_APP_IDS.includes(appId.toLowerCase().trim())
+    )
+  );
+};
+
 // Ephemeral in-memory session store (wiped automatically on browser refresh)
 let inMemorySession = {
   email: "",
@@ -141,81 +159,52 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // 2. Verify role against central employees and users collections
+      // 2. Verify authorization against central 'users' collection in Admin Console
       try {
-        let detectedRole = "";
+        const usersQuery = query(
+          collection(db, "users"),
+          where("email", "==", normalizedEmail)
+        );
+        const querySnapshot = await getDocs(usersQuery);
 
-        // Check employees collection (Master Blueprint Central Directory)
-        try {
-          const empQuery = query(
-            collection(db, "employees"),
-            where("email", "==", normalizedEmail)
-          );
-          const empSnap = await getDocs(empQuery);
-          if (!empSnap.empty) {
-            const empData = empSnap.docs[0].data();
-            const rawRole = (empData.role || empData.assignedRole || "").toLowerCase().trim();
-            const dept = (empData.department || "").toLowerCase();
-            const desig = (empData.designation || "").toLowerCase();
-            
-            if (rawRole === "owner" || rawRole === "admin") {
-              detectedRole = rawRole;
-            } else if (
-              rawRole.includes("design") ||
-              rawRole.includes("engineer") ||
-              rawRole.includes("architect") ||
-              dept.includes("design") ||
-              dept.includes("engineer") ||
-              desig.includes("design") ||
-              desig.includes("engineer") ||
-              desig.includes("architect")
-            ) {
-              detectedRole = "designer";
-            } else if (rawRole) {
-              detectedRole = rawRole;
-            } else {
-              detectedRole = "designer";
-            }
-          }
-        } catch (err) {
-          console.warn("Could not query employees collection:", err);
-        }
-
-        // If not found in employees, check users collection (Mirrored auth profile)
-        if (!detectedRole) {
-          try {
-            const usersQuery = query(
-              collection(db, "users"),
-              where("email", "==", normalizedEmail)
-            );
-            const userSnap = await getDocs(usersQuery);
-            if (!userSnap.empty) {
-              const userData = userSnap.docs[0].data();
-              detectedRole = userData.role || userData.assignedRole || "";
-            }
-          } catch (err) {
-            console.warn("Could not query users collection:", err);
-          }
-        }
-
-        const normalizedRole = detectedRole.toLowerCase().trim();
-
-        if (ALLOWED_ROLES.includes(normalizedRole) || (detectedRole && detectedRole.length > 0)) {
-          const finalRole = normalizedRole === "owner" || normalizedRole === "admin" ? normalizedRole : "designer";
-          setRole(finalRole);
-          setStoredEnterpriseAuth(normalizedEmail, finalRole);
-          setUnauthorizedError(null);
-        } else {
-          // Deny access: clear tokens and show unauthorized screen
+        if (querySnapshot.empty) {
           clearStoredEnterpriseAuth();
+          setUser(null);
+          setEmail("");
           setRole("");
           setUnauthorizedError(
-            `Access Denied: Your account (${normalizedEmail}) does not have authorized Designer, Admin, or Owner permissions in the central database.`
+            `Access Denied: The email "${normalizedEmail}" was not found in the authorized user roster. Please contact your administrator.`
           );
+          return;
         }
+
+        const userDoc = querySnapshot.docs[0]?.data();
+        const accessibleApps: string[] = Array.isArray(userDoc?.accessibleApps) ? userDoc.accessibleApps : [];
+
+        const hasAccess = checkHasDesignStudioAccess(accessibleApps);
+
+        if (!hasAccess) {
+          // Deny entry immediately
+          clearStoredEnterpriseAuth();
+          setUser(null);
+          setEmail("");
+          setRole("");
+          setUnauthorizedError("Access Denied: You do not have permission to access Design Studio.");
+          return;
+        }
+
+        const rawRole = (userDoc?.role || userDoc?.assignedRole || "designer").toLowerCase().trim();
+        const finalRole = rawRole === "owner" || rawRole === "admin" ? rawRole : "designer";
+
+        setRole(finalRole);
+        setStoredEnterpriseAuth(normalizedEmail, finalRole);
+        setUnauthorizedError(null);
       } catch (error) {
         console.error("Error verifying user permissions:", error);
         clearStoredEnterpriseAuth();
+        setUser(null);
+        setEmail("");
+        setRole("");
         setUnauthorizedError("Error verifying permissions. Please check connection or contact system administrator.");
       } finally {
         if (isMounted) {
@@ -291,9 +280,9 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
         type: "PASSWORD_RESET_REQUEST",
         requestedEmail: email.toLowerCase().trim(),
         email: email.toLowerCase().trim(),
-        appName: "Solarithm Designer's Project Sheet",
-        appId: "designer-portal",
-        reason: "Access authorization requested from Designer Portal",
+        appName: "Solarithm Design Studio",
+        appId: DESIGN_STUDIO_APP_ID,
+        reason: "Access authorization requested for Design Studio",
         status: "pending",
         timestamp: new Date().toISOString()
       });
@@ -305,9 +294,9 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
           actor: email.toLowerCase().trim(),
           target: email.toLowerCase().trim(),
           details: {
-            appName: "Solarithm Designer's Project Sheet",
-            appId: "designer-portal",
-            reason: "Access authorization requested from Designer Portal"
+            appName: "Solarithm Design Studio",
+            appId: DESIGN_STUDIO_APP_ID,
+            reason: "Access authorization requested for Design Studio"
           },
           timestamp: new Date().toISOString()
         });

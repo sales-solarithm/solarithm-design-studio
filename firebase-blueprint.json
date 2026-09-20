@@ -70,7 +70,8 @@
         { "name": "role", "type": "string" },
         { "name": "assignedRole", "type": "string" },
         { "name": "department", "type": "string" },
-        { "name": "designation", "type": "string" }
+        { "name": "designation", "type": "string" },
+        { "name": "accessibleApps", "type": "array" }
       ],
       "indexes": [
         {
