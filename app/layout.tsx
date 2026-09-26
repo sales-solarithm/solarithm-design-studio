@@ -8,8 +8,12 @@ const inter = Inter({ subsets: ['latin'], variable: '--font-inter' });
 const playfair = Playfair_Display({ subsets: ['latin'], variable: '--font-playfair' });
 
 export const metadata: Metadata = {
-  title: 'Solarithm Designer Dashboard',
-  description: 'Designer Project Sheet for Solarithm',
+  title: "Solarithm Designer's Project Sheet",
+  description: "Distraction-free workspace for designers to view their assigned projects and update their progress.",
+  openGraph: {
+    title: "Solarithm Designer's Project Sheet",
+    description: "Distraction-free workspace for designers to view their assigned projects and update their progress.",
+  },
 };
 
 export default function RootLayout({children}: {children: React.ReactNode}) {
@@ -21,15 +25,17 @@ export default function RootLayout({children}: {children: React.ReactNode}) {
             __html: `
               (function() {
                 try {
-                  var stored = localStorage.getItem('solarithm-theme');
-                  var isDark = stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches) || (stored === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+                  var stored = localStorage.getItem('solarithm-theme') || localStorage.getItem('theme');
+                  var isDark = stored ? stored === 'dark' : true;
+                  var root = document.documentElement;
                   if (isDark) {
-                    document.documentElement.classList.add('dark');
-                    document.documentElement.style.colorScheme = 'dark';
+                    root.classList.add('dark');
+                    root.classList.remove('light');
+                    root.style.colorScheme = 'dark';
                   } else {
-                    document.documentElement.classList.remove('dark');
-                    document.documentElement.classList.add('light');
-                    document.documentElement.style.colorScheme = 'light';
+                    root.classList.remove('dark');
+                    root.classList.add('light');
+                    root.style.colorScheme = 'light';
                   }
                 } catch (e) {}
               })();

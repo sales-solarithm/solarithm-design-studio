@@ -1,8 +1,8 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 
-type Theme = 'light' | 'dark' | 'system';
+export type Theme = "light" | "dark";
 
 interface ThemeContextType {
   theme: Theme;
@@ -12,61 +12,61 @@ interface ThemeContextType {
 
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
+const getInitialTheme = (): Theme => {
+  if (typeof window === "undefined") return "dark";
+  try {
+    const stored = localStorage.getItem("solarithm-theme") || localStorage.getItem("theme");
+    if (stored === "light" || stored === "dark") {
+      return stored as Theme;
+    }
+    if (document.documentElement.classList.contains("light")) {
+      return "light";
+    }
+  } catch {}
+  return "dark";
+};
+
 export const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
-  const [theme, setTheme] = useState<Theme>(() => {
-    if (typeof window !== 'undefined') {
-      return (localStorage.getItem('solarithm-theme') as Theme) || 'system';
-    }
-    return 'system';
-  });
+  const [theme, setThemeState] = useState<Theme>(getInitialTheme);
 
-  const applyThemeToDocument = (themeToApply: Theme) => {
-    if (typeof window === 'undefined') return;
+  const applyThemeToDOM = useCallback((newTheme: Theme) => {
+    if (typeof window === "undefined") return;
     const root = document.documentElement;
-    root.classList.remove('light', 'dark');
-
-    let resolvedDark = false;
-    if (themeToApply === 'system') {
-      resolvedDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (newTheme === "dark") {
+      root.classList.add("dark");
+      root.classList.remove("light");
+      root.style.colorScheme = "dark";
     } else {
-      resolvedDark = themeToApply === 'dark';
+      root.classList.remove("dark");
+      root.classList.add("light");
+      root.style.colorScheme = "light";
     }
+    try {
+      localStorage.setItem("solarithm-theme", newTheme);
+      localStorage.setItem("theme", newTheme);
+    } catch {}
+  }, []);
 
-    if (resolvedDark) {
-      root.classList.add('dark');
-      root.style.colorScheme = 'dark';
-    } else {
-      root.classList.remove('dark');
-      root.classList.add('light');
-      root.style.colorScheme = 'light';
-    }
-  };
-
+  // Synchronize DOM with the current theme state
   useEffect(() => {
-    applyThemeToDocument(theme);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('solarithm-theme', theme);
-    }
+    applyThemeToDOM(theme);
+  }, [theme, applyThemeToDOM]);
 
-    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    const handleSystemChange = () => {
-      if (theme === 'system') {
-        applyThemeToDocument('system');
-      }
-    };
-    mediaQuery.addEventListener('change', handleSystemChange);
-    return () => mediaQuery.removeEventListener('change', handleSystemChange);
-  }, [theme]);
+  const setTheme = useCallback(
+    (newTheme: Theme) => {
+      setThemeState(newTheme);
+      applyThemeToDOM(newTheme);
+    },
+    [applyThemeToDOM]
+  );
 
-  const toggleTheme = () => {
-    const isCurrentlyDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
-    const nextTheme: Theme = isCurrentlyDark ? 'light' : 'dark';
-    setTheme(nextTheme);
-    applyThemeToDocument(nextTheme);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('solarithm-theme', nextTheme);
-    }
-  };
+  const toggleTheme = useCallback(() => {
+    setThemeState((prev) => {
+      const next: Theme = prev === "dark" ? "light" : "dark";
+      applyThemeToDOM(next);
+      return next;
+    });
+  }, [applyThemeToDOM]);
 
   return (
     <ThemeContext.Provider value={{ theme, setTheme, toggleTheme }}>
@@ -77,6 +77,8 @@ export const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
 
 export const useTheme = () => {
   const context = useContext(ThemeContext);
-  if (!context) throw new Error('useTheme must be used within a ThemeProvider');
+  if (!context) {
+    throw new Error("useTheme must be used within a ThemeProvider");
+  }
   return context;
 };
