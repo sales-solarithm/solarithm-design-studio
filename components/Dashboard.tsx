@@ -1,8 +1,21 @@
 "use client";
 
 import { useState, useEffect, useMemo, useRef } from "react";
+import { onAuthStateChanged, User } from "firebase/auth";
 import { auth, db } from "@/lib/firebase";
-import { collection, query, where, onSnapshot, doc, updateDoc, serverTimestamp, addDoc, getDocs, Timestamp } from "firebase/firestore";
+import { 
+  collection, 
+  query, 
+  where, 
+  onSnapshot, 
+  doc, 
+  getDoc,
+  updateDoc, 
+  serverTimestamp, 
+  addDoc, 
+  getDocs, 
+  Timestamp 
+} from "firebase/firestore";
 import { 
   LogOut, 
   LayoutDashboard, 
@@ -36,22 +49,42 @@ import {
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 import ThemeToggle from "./ThemeToggle";
-import { COLLECTIONS, PROJECT_STATUS, PROJECT_FIELDS, CLIENT_STATUS } from "@/src/config/schema";
+import { sanitizeFirestorePayload } from "@/lib/firestoreSanitizer";
+import { 
+  COLLECTIONS, 
+  CANONICAL_PROJECT_STATUS,
+  CANONICAL_STATUS_LIST,
+  CANONICAL_STATUS_LABELS,
+  normalizeProjectStatus,
+  PROJECT_FIELDS, 
+  CLIENT_STATUS,
+  resolveProjectDate,
+  formatCapacity,
+  formatNumericMetric,
+  validateDeliverableFile,
+  isDesignerRestrictedField,
+  deriveClientCodePrefix,
+  generateProjectCode,
+  safeStringIdentifier
+} from "@/src/config/schema";
 
 type Project = {
   id: string;
   projectNumber?: string;
   srNumber: string;
+  srNo?: number | string;
   projectName: string;
   clientName: string;
   clientId?: string;
   scopeOfWork: string;
   subService?: string;
+  projectSector?: string;
   pricingCategory?: string;
   plantCapacity: number | string | null;
   capacityUnit?: string;
   location?: string;
   projectDate: string;
+  date?: string;
   salesPerson: string;
   designerEmail: string;
   assignedScopes?: Record<string, any> | Array<any>;
@@ -86,99 +119,107 @@ type ChangeRequest = {
   createdAt: any;
 };
 
-const STATUS_OPTIONS = [
-  PROJECT_STATUS.NOT_STARTED,
-  PROJECT_STATUS.IN_PROGRESS,
-  PROJECT_STATUS.PENDING_DESIGN_APPROVAL,
-  PROJECT_STATUS.DESIGN_APPROVED,
-  PROJECT_STATUS.COMPLETED
-];
+const STATUS_OPTIONS = CANONICAL_STATUS_LIST;
 
 const STATUS_LABELS: Record<string, string> = {
-  [PROJECT_STATUS.NOT_STARTED]: 'Not Started',
-  [PROJECT_STATUS.IN_PROGRESS]: 'In Progress',
-  [PROJECT_STATUS.PENDING_DESIGN_APPROVAL]: 'Pending Approval',
-  [PROJECT_STATUS.DESIGN_APPROVED]: 'Design Approved',
-  [PROJECT_STATUS.COMPLETED]: 'Completed',
-  'required_data_pending': 'Required Data Pending',
-  'in_revision': 'In Revision',
-  'in_verification': 'In Verification',
-  'delayed': 'Delayed'
+  ...CANONICAL_STATUS_LABELS,
+  'ASSIGNED': 'Assigned',
+  'IN_PROGRESS': 'In Progress',
+  'SUBMITTED': 'Submitted',
+  'UNDER_REVIEW': 'Under Review',
+  'REVISION_REQUESTED': 'Revision Requested',
+  'APPROVED': 'Approved',
+  'COMPLETED': 'Completed',
+  'not_started': 'Assigned',
+  'in_progress': 'In Progress',
+  'pending_design_approval': 'Submitted',
+  'design_approved': 'Approved',
+  'required_data_pending': 'Under Review',
+  'in_revision': 'Revision Requested',
+  'in_verification': 'Under Review',
+  'delayed': 'In Progress',
+  'completed': 'Completed'
 };
 
 /**
- * Safely extracts timestamp (in milliseconds) evaluating in strict priority:
- * 1. projectDate
- * 2. date (or project.date)
- * 3. createdAt
- * 4. updatedAt
- * Safely handles ISO strings ("YYYY-MM-DD"), timestamps, and dates without runtime exceptions.
+ * Standardized Date Resolution (PRJ-02):
+ * Priority: projectDate -> date -> createdAt -> updatedAt
  */
 export const getProjectDateTimestamp = (project: any): number => {
-  if (!project) return 0;
-
-  const parseVal = (val: any): number => {
-    if (!val) return 0;
-    if (typeof val === 'number') {
-      return isNaN(val) ? 0 : val;
-    }
-    if (typeof val.toMillis === 'function') {
-      try { return val.toMillis(); } catch {}
-    }
-    if (typeof val.toDate === 'function') {
-      try { return val.toDate().getTime(); } catch {}
-    }
-    if (typeof val.seconds === 'number') {
-      return val.seconds * 1000 + (val.nanoseconds ? Math.floor(val.nanoseconds / 1e6) : 0);
-    }
-    if (val instanceof Date) {
-      const ms = val.getTime();
-      return isNaN(ms) ? 0 : ms;
-    }
-    if (typeof val === 'string') {
-      const s = val.trim();
-      if (!s) return 0;
-      const parsed = Date.parse(s);
-      if (!isNaN(parsed)) return parsed;
-      const parts = s.split(/[-/.]/);
-      if (parts.length === 3) {
-        if (parts[0].length === 4) {
-          const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
-          if (!isNaN(d.getTime())) return d.getTime();
-        } else if (parts[2].length === 4) {
-          const d = new Date(parseInt(parts[2], 10), parseInt(parts[1], 10) - 1, parseInt(parts[0], 10));
-          if (!isNaN(d.getTime())) return d.getTime();
-        }
-      }
-    }
-    return 0;
-  };
-
-  const pDate = parseVal(project.projectDate);
-  if (pDate > 0) return pDate;
-
-  const dDate = parseVal(project.date);
-  if (dDate > 0) return dDate;
-
-  const cDate = parseVal(project.createdAt);
-  if (cDate > 0) return cDate;
-
-  const uDate = parseVal(project.updatedAt);
-  if (uDate > 0) return uDate;
-
-  return 0;
+  return resolveProjectDate(project).timestamp;
 };
 
 export const getProjectDateObj = (project: any): Date | null => {
-  const ts = getProjectDateTimestamp(project);
-  if (!ts) return null;
-  const d = new Date(ts);
-  return isNaN(d.getTime()) ? null : d;
+  return resolveProjectDate(project).dateObj;
+};
+
+// Master engineering taxonomy mapping for known canonical forms and raw database keys
+export const MASTER_SCOPE_TAXONOMY: Record<string, string> = {
+  pipecalculation: "PIPE CALCULATION",
+  pipe_calculation: "PIPE CALCULATION",
+  detaildesign: "DETAIL DESIGN",
+  detail_design: "DETAIL DESIGN",
+  galayout: "GA LAYOUT",
+  ga_layout: "GA LAYOUT",
+  ifpprocess: "IFP PROCESS",
+  ifp_process: "IFP PROCESS",
+  ceilayouts: "CEI LAYOUTS",
+  cei_layouts: "CEI LAYOUTS",
+  ceig: "CEIG",
+  ceigapprovals: "CEIG Approvals",
+  ceig_approvals: "CEIG Approvals",
+  ifp: "IFP",
+  ifppackage: "IFP Package",
+  pvsyst: "PVsyst",
+  predesign: "Pre-Design",
+  pre_design: "Pre-Design",
+  postdesign: "Post-Design",
+  post_design: "Post-Design",
+  detailedengineering: "Detailed Engineering",
+  detailed_engineering: "Detailed Engineering",
+  singlelinediagram: "Single Line Diagram (SLD)",
+  sld: "Single Line Diagram (SLD)",
+  billofmaterials: "Bill of Materials (BOM)",
+  bom: "Bill of Materials (BOM)",
+  permitpackage: "Permit Package",
+  permit_package: "Permit Package",
+  pestamping: "PE Stamping",
+  pe_stamping: "PE Stamping",
+  asbuilt: "As-Built Drawing",
+  as_built: "As-Built Drawing",
+  asbuiltdrawing: "As-Built Drawing",
+  interconnection: "Interconnection Study",
+  interconnectionstudy: "Interconnection Study",
+  standarddesign: "Standard Design",
+  standard_design: "Standard Design"
+};
+
+// Known technical acronyms and mixed-case terms that should maintain strict casing
+export const KNOWN_PRESERVED_WORDS: Record<string, string> = {
+  pvsyst: "PVsyst",
+  ceig: "CEIG",
+  cei: "CEI",
+  ifp: "IFP",
+  ga: "GA",
+  sld: "SLD",
+  bom: "BOM",
+  pe: "PE",
+  kw: "kW",
+  mw: "MW",
+  dc: "DC",
+  ac: "AC"
 };
 
 export const toTitleCase = (str: string) => {
   if (!str) return str;
-  return str.toLowerCase().split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+  // If already uppercase acronym or short term like CEIG/SLD/IFP, preserve it
+  if (str === str.toUpperCase() && str.length <= 4 && !str.includes(' ')) return str;
+  return str.split(/([\s-]+)/).map(part => {
+    if (part === ' ' || part === '-' || !part) return part;
+    const lower = part.toLowerCase();
+    if (KNOWN_PRESERVED_WORDS[lower]) return KNOWN_PRESERVED_WORDS[lower];
+    return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+  }).join('');
 };
 
 export const normalizeEmail = (email: string | null | undefined): string => {
@@ -190,6 +231,106 @@ export const normalizeStr = (str: string | null | undefined): string => {
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]/g, "");
+};
+
+/**
+ * Resolves a single scope string to its canonical Admin Console / engineering label.
+ */
+export const resolveSingleScope = (
+  scopeStr: string,
+  scopesCatalog?: { name: string }[],
+  rulesCatalog?: any[]
+): string => {
+  if (!scopeStr) return "";
+  const trimmed = scopeStr.trim();
+  if (!trimmed) return "";
+
+  // 1. Check exact match in Firestore scopes collection (canonical labels from Admin Console)
+  if (scopesCatalog && Array.isArray(scopesCatalog)) {
+    const exact = scopesCatalog.find(s => s?.name && s.name.trim() === trimmed);
+    if (exact) return exact.name.trim();
+  }
+
+  // 2. Fallback Taxonomy Resolution: Match against master scope list fetched from Firestore by normalizing
+  const normalizedKey = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (scopesCatalog && Array.isArray(scopesCatalog)) {
+    const matched = scopesCatalog.find(
+      s => s?.name && s.name.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedKey
+    );
+    if (matched) return matched.name.trim();
+  }
+
+  // 3. Check against pricing rules catalog
+  if (rulesCatalog && Array.isArray(rulesCatalog)) {
+    const ruleMatch = rulesCatalog.find(
+      r => r?.scope && r.scope.toLowerCase().replace(/[^a-z0-9]/g, '') === normalizedKey
+    );
+    if (ruleMatch) return ruleMatch.scope.trim();
+  }
+
+  // 4. Check known master taxonomy dictionary
+  if (MASTER_SCOPE_TAXONOMY[normalizedKey]) {
+    return MASTER_SCOPE_TAXONOMY[normalizedKey];
+  }
+
+  // 5. If it's already an uppercase phrase with spaces (e.g., "PIPE CALCULATION", "DETAIL DESIGN"), keep as-is
+  if (trimmed === trimmed.toUpperCase() && trimmed.length > 2 && !trimmed.includes('_')) {
+    return trimmed;
+  }
+
+  // 6. If snake_case, replace underscores with spaces
+  let formatted = trimmed.replace(/_/g, ' ');
+
+  // 7. If camelCase without spaces (e.g., "pipeCalculation"), insert space before uppercase letters
+  formatted = formatted.replace(/([a-z])([A-Z])/g, '$1 $2');
+
+  // 8. Strict Word Boundary Title Casing with Delimiter Preservation (spaces and hyphens)
+  const words = formatted.split(/([\s-]+)/);
+  const titleCased = words.map(w => {
+    if (w === ' ' || w === '-' || !w.trim()) return w;
+    const wLower = w.toLowerCase();
+    if (KNOWN_PRESERVED_WORDS[wLower]) {
+      return KNOWN_PRESERVED_WORDS[wLower];
+    }
+    if (w === w.toUpperCase() && w.length >= 2 && !wLower.includes('the') && !wLower.includes('and')) {
+      return w;
+    }
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  }).join('');
+
+  return titleCased;
+};
+
+/**
+ * High-fidelity scope formatter preserving compound scopes with '+' or ',',
+ * ensuring clean spacing around delimiters and canonical labels from the Admin Console.
+ */
+export const formatScopeDisplay = (
+  scopeStr: string | null | undefined,
+  scopesCatalog?: { name: string }[],
+  rulesCatalog?: any[]
+): string => {
+  if (!scopeStr || scopeStr === "—") return "—";
+
+  // Handle compound scopes with '+' (Directive 2.3: preserve proper spacing around delimiters)
+  if (scopeStr.includes('+')) {
+    return scopeStr
+      .split('+')
+      .map(part => resolveSingleScope(part, scopesCatalog, rulesCatalog))
+      .filter(Boolean)
+      .join(' + ');
+  }
+
+  // Handle compound scopes with ','
+  if (scopeStr.includes(',')) {
+    return scopeStr
+      .split(',')
+      .map(part => resolveSingleScope(part, scopesCatalog, rulesCatalog))
+      .filter(Boolean)
+      .join(', ');
+  }
+
+  return resolveSingleScope(scopeStr, scopesCatalog, rulesCatalog);
 };
 
 /**
@@ -215,21 +356,36 @@ export const getScopeKey = (scopeName: string): string => {
 /**
  * Formats scope keys/slugs into high-fidelity human readable engineering titles
  */
-export const formatScopeName = (scopeKeyOrName: string): string => {
+export const formatScopeName = (
+  scopeKeyOrName: string,
+  scopesCatalog?: any,
+  rulesCatalog?: any
+): string => {
   if (!scopeKeyOrName) return "";
-  const lower = scopeKeyOrName.toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (lower === "pvsyst") return "PVsyst";
-  if (lower === "predesign") return "Pre-Design";
-  if (lower === "sld") return "Single Line Diagram (SLD)";
-  if (lower === "bom") return "Bill of Materials (BOM)";
-  if (lower === "ceig") return "CEIG Approvals";
-  if (lower === "ifp") return "IFP Package";
-  if (lower === "detailedengineering") return "Detailed Engineering";
-  if (lower === "pestamping") return "PE Stamping";
-  if (lower === "permitpackage") return "Permit Package";
-  if (lower === "asbuilt") return "As-Built Drawing";
-  if (lower === "interconnection") return "Interconnection Study";
-  return toTitleCase(scopeKeyOrName.replace(/_/g, ' '));
+  const safeScopes = Array.isArray(scopesCatalog) ? scopesCatalog : undefined;
+  const safeRules = Array.isArray(rulesCatalog) ? rulesCatalog : undefined;
+  return formatScopeDisplay(scopeKeyOrName, safeScopes, safeRules);
+};
+
+/**
+ * Directive 4: Format staff for designer select dropdowns
+ * Matches staff whose role or designation is 'DESIGNER', 'LEAD_DESIGNER', or 'OWNER'.
+ * Formats company partners as Full Name (Partner / Designer).
+ */
+export const formatDesignerOption = (
+  person: { email: string; name?: string; role?: string },
+  isCurrentUser = false
+): string => {
+  const roleUpper = (person.role || "").toUpperCase();
+  const displayName = person.name && person.name.toLowerCase() !== person.email.toLowerCase()
+    ? person.name
+    : person.email;
+  const isPartner = roleUpper === "OWNER" || roleUpper.includes("OWNER") || roleUpper.includes("PARTNER");
+
+  if (isPartner) {
+    return `${displayName} (Partner / Designer)${isCurrentUser ? " (You)" : ""}`;
+  }
+  return `${displayName} (${person.email})${isCurrentUser ? " (You)" : ""}`;
 };
 
 /**
@@ -348,7 +504,7 @@ export const getDesignerAssignedScopes = (
     if (normalizeEmail(project.designerEmail) === targetEmail) {
       if (project.scopeOfWork) {
         const parts = project.scopeOfWork.split(",").map(s => s.trim()).filter(Boolean);
-        return parts.length > 0 ? parts.map(formatScopeName) : [formatScopeName(project.scopeOfWork)];
+        return parts.length > 0 ? parts.map(p => formatScopeName(p)) : [formatScopeName(project.scopeOfWork)];
       }
     }
   }
@@ -357,24 +513,31 @@ export const getDesignerAssignedScopes = (
 };
 
 /**
- * Checks whether a designer is assigned to at least one scope within the assignedScopes object
+ * Checks whether a designer is assigned to at least one scope, module, phase, or designer field within the project.
+ * Strictly evaluates against targetEmail (no owner/admin bypass).
  */
 export const isDesignerAssignedToProject = (
-  project: Project,
+  project: Project | any,
   designerEmail: string,
-  isOwnerOrAdmin: boolean = false
+  _isOwnerOrAdmin: boolean = false
 ): boolean => {
-  if (isOwnerOrAdmin) return true;
   if (!project || !designerEmail) return false;
   const targetEmail = normalizeEmail(designerEmail);
+  if (!targetEmail) return false;
 
+  // 1. Direct designerEmail matching
+  if (normalizeEmail(project.designerEmail) === targetEmail) return true;
+
+  // 2. assignedScopes matching:
+  // - If object: check if any value or nested designerEmail equals targetEmail (e.g. assignedScopes.preDesign === targetEmail)
+  // - If array: check each item's designerEmail or string
   const rawAssignedScopes = project.assignedScopes;
-
   if (rawAssignedScopes && typeof rawAssignedScopes === "object") {
     if (Array.isArray(rawAssignedScopes)) {
-      return rawAssignedScopes.some(item => {
+      const match = rawAssignedScopes.some(item => {
+        if (!item) return false;
         if (typeof item === "string") return normalizeEmail(item) === targetEmail;
-        if (item && typeof item === "object") {
+        if (typeof item === "object") {
           const itemEmail = normalizeEmail(
             item.designerEmail || item.email || item.assignedTo || item.userEmail || item.assignedDesigner
           );
@@ -382,11 +545,13 @@ export const isDesignerAssignedToProject = (
         }
         return false;
       });
+      if (match) return true;
     } else {
       for (const [, scopeVal] of Object.entries(rawAssignedScopes)) {
+        if (!scopeVal) continue;
         if (typeof scopeVal === "string") {
           if (normalizeEmail(scopeVal) === targetEmail) return true;
-        } else if (scopeVal && typeof scopeVal === "object") {
+        } else if (typeof scopeVal === "object") {
           const valObj = scopeVal as Record<string, any>;
           const valEmail = normalizeEmail(
             valObj.designerEmail || valObj.email || valObj.assignedTo || valObj.userEmail || valObj.assignedDesigner
@@ -394,55 +559,116 @@ export const isDesignerAssignedToProject = (
           if (valEmail === targetEmail) return true;
         }
       }
-      // If assignedScopes was explicitly provided as an object, and designer is not in it:
-      return false;
     }
   }
 
-  // Fallback for legacy projects where assignedScopes is undefined
-  if (normalizeEmail(project.designerEmail) === targetEmail) return true;
-  if (project.assignedPhases && project.assignedPhases.some(e => normalizeEmail(e) === targetEmail)) return true;
+  // 3. modules matching:
+  // - If array: check if any module has m.assignedDesignerEmail === targetEmail or m.designerEmail === targetEmail
+  if (Array.isArray(project.modules)) {
+    const moduleMatch = project.modules.some((m: any) => {
+      if (!m) return false;
+      if (typeof m === "string") return normalizeEmail(m) === targetEmail;
+      if (typeof m === "object") {
+        return (
+          normalizeEmail(m.assignedDesignerEmail) === targetEmail ||
+          normalizeEmail(m.designerEmail) === targetEmail ||
+          normalizeEmail(m.email) === targetEmail ||
+          normalizeEmail(m.assignedTo) === targetEmail ||
+          normalizeEmail(m.assignedDesigner) === targetEmail
+        );
+      }
+      return false;
+    });
+    if (moduleMatch) return true;
+  }
+
+  // 4. phases matching:
+  // - If object: check if any phase has ph.designerEmail === targetEmail
   if (project.phases && typeof project.phases === "object") {
-    if (Object.values(project.phases).some(ph => normalizeEmail(ph?.designerEmail) === targetEmail)) {
-      return true;
+    if (Array.isArray(project.phases)) {
+      const phaseArrMatch = project.phases.some((ph: any) => {
+        if (!ph) return false;
+        if (typeof ph === "string") return normalizeEmail(ph) === targetEmail;
+        return (
+          normalizeEmail(ph.designerEmail) === targetEmail ||
+          normalizeEmail(ph.email) === targetEmail
+        );
+      });
+      if (phaseArrMatch) return true;
+    } else {
+      for (const [, ph] of Object.entries(project.phases)) {
+        if (!ph) continue;
+        if (typeof ph === "string") {
+          if (normalizeEmail(ph) === targetEmail) return true;
+        } else if (typeof ph === "object") {
+          const phObj = ph as Record<string, any>;
+          if (
+            normalizeEmail(phObj.designerEmail) === targetEmail ||
+            normalizeEmail(phObj.email) === targetEmail ||
+            normalizeEmail(phObj.assignedTo) === targetEmail
+          ) {
+            return true;
+          }
+        }
+      }
     }
+  }
+
+  // 5. assignedPhases matching:
+  // - If array: check if it includes targetEmail
+  if (Array.isArray(project.assignedPhases)) {
+    const assignedPhasesMatch = project.assignedPhases.some((e: any) => {
+      if (!e) return false;
+      if (typeof e === "string") return normalizeEmail(e) === targetEmail;
+      if (typeof e === "object") {
+        return normalizeEmail(e.designerEmail || e.email || e.designer) === targetEmail;
+      }
+      return false;
+    });
+    if (assignedPhasesMatch) return true;
   }
 
   return false;
 };
 
 const getStatusColor = (status: string) => {
-  const norm = (status || "").toLowerCase();
-  switch (norm) {
-    case "not_started":
-    case "not started":
-    case "delayed":
-      return "px-2 py-1 rounded text-xs font-medium border text-center text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10 border-rose-200 dark:border-rose-500/30";
-    case "in_progress":
-    case "in progress":
-    case "pending_design_approval":
-    case "pending":
-      return "px-2 py-1 rounded text-xs font-medium border text-center text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10 border-amber-200 dark:border-amber-500/30";
-    case "design_approved":
-    case "approved":
-    case "completed":
-      return "px-2 py-1 rounded text-xs font-medium border text-center text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/30";
-    case "required_data_pending":
-    case "in_revision":
-    case "in revision":
-    case "in_verification":
-    case "in verification":
-      return "px-2 py-1 rounded text-xs font-medium border text-center text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border-blue-200 dark:border-blue-500/30";
+  const canonical = normalizeProjectStatus(status);
+  switch (canonical) {
+    case CANONICAL_PROJECT_STATUS.ASSIGNED:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-rose-700 dark:text-rose-400 bg-rose-50 dark:bg-rose-500/10 border-rose-200 dark:border-rose-500/30";
+    case CANONICAL_PROJECT_STATUS.IN_PROGRESS:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-500/10 border-amber-200 dark:border-amber-500/30";
+    case CANONICAL_PROJECT_STATUS.SUBMITTED:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-500/10 border-blue-200 dark:border-blue-500/30";
+    case CANONICAL_PROJECT_STATUS.UNDER_REVIEW:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-purple-700 dark:text-purple-400 bg-purple-50 dark:bg-purple-500/10 border-purple-200 dark:border-purple-500/30";
+    case CANONICAL_PROJECT_STATUS.REVISION_REQUESTED:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-orange-700 dark:text-orange-400 bg-orange-50 dark:bg-orange-500/10 border-orange-200 dark:border-orange-500/30";
+    case CANONICAL_PROJECT_STATUS.APPROVED:
+    case CANONICAL_PROJECT_STATUS.COMPLETED:
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/30";
     default:
-      return "px-2 py-1 rounded text-xs font-medium border text-center text-gray-700 dark:text-gray-400 bg-gray-50 dark:bg-gray-500/10 border-gray-200 dark:border-gray-500/30";
+      return "px-2.5 py-1 rounded text-xs font-semibold border text-center text-gray-700 dark:text-gray-400 bg-gray-50 dark:bg-gray-500/10 border-gray-200 dark:border-gray-500/30";
   }
 };
 
 export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: string, lockedEmail: string, onUnlock: () => void }) {
+  // DIRECTIVE 4: Track initialized auth state to prevent Firestore listener crashes
+  const [currentUser, setCurrentUser] = useState<User | null>(() => auth.currentUser);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setCurrentUser(u);
+    });
+    return () => unsub();
+  }, []);
+
   const [projectsList, setProjectsList] = useState<Project[]>([]);
   const [projectSubTab, setProjectSubTab] = useState<'assigned' | 'my'>('assigned');
   const [changeRequests, setChangeRequests] = useState<ChangeRequest[]>([]);
-  const [scopesData, setScopesData] = useState<{name: string, subServices: string[]}[]>([]);
+  const [rawScopes, setRawScopes] = useState<any[]>([]);
+  const [rawPackages, setRawPackages] = useState<any[]>([]);
+  const [pricingRules, setPricingRules] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [toastMessage, setToastMessage] = useState("");
   
@@ -478,7 +704,65 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
   // Add Project Modal State
   const [isAddProjectModalOpen, setIsAddProjectModalOpen] = useState(false);
   const [approvedClients, setApprovedClients] = useState<{id: string, name: string, salesPersonEmail: string, pricingCategory: string}[]>([]);
-  const [pricingRules, setPricingRules] = useState<any[]>([]);
+
+  // Pure dynamic Admin Console scopes & packages (from /scopes, /packages, /pricingRules)
+  const scopesData = useMemo(() => {
+    const rawItems: any[] = [...rawScopes, ...rawPackages, ...pricingRules];
+    const dedupedMap = new Map<string, { name: string; subServices: string[]; modules?: any[]; [key: string]: any }>();
+
+    rawItems.forEach((item) => {
+      if (!item) return;
+
+      // Filter out deleted/inactive items
+      if (item.active === false || item.status === 'inactive' || item.status === 'deleted') {
+        return;
+      }
+
+      // Extract the exact scope label from item
+      const rawLabel = item.name || item.packageName || item.title || item.label || item.scopeName || item.scope;
+      if (!rawLabel || typeof rawLabel !== 'string' || !rawLabel.trim()) {
+        return;
+      }
+      const label = rawLabel.trim();
+
+      // Extract sub-services or modules
+      let subServices: string[] = [];
+      const rawSubs = item.subServices || item.subService || item.modules;
+      if (Array.isArray(rawSubs)) {
+        rawSubs.forEach((sub: any) => {
+          const sName = typeof sub === 'string' ? sub.trim() : (sub?.name || sub?.title || sub?.label || '');
+          if (sName && typeof sName === 'string' && sName.trim()) {
+            subServices.push(sName.trim());
+          }
+        });
+      } else if (typeof rawSubs === 'string' && rawSubs.trim()) {
+        subServices.push(rawSubs.trim());
+      }
+
+      // Deduplicate scopes case-insensitively: if two entries have the same letters, keep one entry and preserve its exact Admin Console name
+      const lowerKey = label.toLowerCase();
+      if (!dedupedMap.has(lowerKey)) {
+        dedupedMap.set(lowerKey, {
+          name: label, // Exact, verbatim Admin Console name
+          subServices: Array.from(new Set(subServices)),
+          modules: Array.isArray(item.modules) ? item.modules : [],
+          ...item
+        });
+      } else {
+        const existing = dedupedMap.get(lowerKey)!;
+        const mergedSub = Array.from(new Set([...existing.subServices, ...subServices]));
+        existing.subServices = mergedSub;
+        if (Array.isArray(item.modules) && item.modules.length > 0) {
+          existing.modules = Array.from(new Set([...(existing.modules || []), ...item.modules]));
+        }
+      }
+    });
+
+    // Sort the resulting list alphabetically
+    return Array.from(dedupedMap.values()).sort((a, b) => 
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    );
+  }, [rawScopes, rawPackages, pricingRules]);
   const [newProject, setNewProject] = useState({
     clientId: "",
     clientName: "",
@@ -546,11 +830,57 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
   }
 
   const user = auth.currentUser;
-  const userName = user?.displayName || lockedEmail.split('@')[0] || "Designer";
+  const [userName, setUserName] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("solarithm_user_name") || "";
+    }
+    return "";
+  });
+
+  useEffect(() => {
+    if (!lockedEmail) return;
+    const fetchOfficialName = async () => {
+      try {
+        const normEmail = lockedEmail.toLowerCase().trim();
+
+        // 1. Check /users collection from Admin Console
+        const usersSnap = await getDocs(
+          query(collection(db, COLLECTIONS.USERS), where("email", "==", normEmail))
+        );
+        if (!usersSnap.empty) {
+          const u = usersSnap.docs[0].data();
+          const officialName = u.name || u.displayName || u.fullName || u.employeeName;
+          if (officialName) {
+            setUserName(officialName.trim());
+            localStorage.setItem("solarithm_user_name", officialName.trim());
+            return;
+          }
+        }
+
+        // 2. Check /employees directory from Admin Console
+        const empSnap = await getDocs(
+          query(collection(db, COLLECTIONS.EMPLOYEES), where("email", "==", normEmail))
+        );
+        if (!empSnap.empty) {
+          const emp = empSnap.docs[0].data();
+          const officialName = emp.name || emp.displayName || emp.fullName || emp.employeeName;
+          if (officialName) {
+            setUserName(officialName.trim());
+            localStorage.setItem("solarithm_user_name", officialName.trim());
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn("Notice: Error fetching official name:", err);
+      }
+    };
+
+    fetchOfficialName();
+  }, [lockedEmail]);
 
   // Derive active/completed projects list using client-side filter to prevent disappearing on status change
-  const activeProjectsList = projectsList.filter(p => p.status !== PROJECT_STATUS.COMPLETED);
-  const completedProjectsList = projectsList.filter(p => p.status === PROJECT_STATUS.COMPLETED);
+  const activeProjectsList = projectsList.filter(p => normalizeProjectStatus(p.status) !== CANONICAL_PROJECT_STATUS.COMPLETED);
+  const completedProjectsList = projectsList.filter(p => normalizeProjectStatus(p.status) === CANONICAL_PROJECT_STATUS.COMPLETED);
 
   // Compute computed active-tab project display
   const projects = projectSubTab === 'assigned' ? activeProjectsList : completedProjectsList;
@@ -572,30 +902,24 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
   // Derive unique scopes for column filter
   const uniqueScopes = useMemo(() => {
-    const standard = [
-      "PVsyst",
-      "Pre-Design",
-      "Permit Package",
-      "Detailed Engineering",
-      "Single Line Diagram (SLD)",
-      "Bill of Materials (BOM)",
-      "CEIG Approvals",
-      "IFP Package",
-      "PE Stamping",
-      "As-Built Drawing",
-      "Interconnection Study"
-    ];
-    const set = new Set<string>(standard);
+    const set = new Set<string>();
+    // Add scopes from master Admin Console catalog
+    if (Array.isArray(scopesData)) {
+      scopesData.forEach(s => {
+        if (s?.name) set.add(s.name);
+      });
+    }
     projects.forEach(p => {
       if (p.scopeOfWork) {
-        p.scopeOfWork.split(',').forEach(s => {
-          const t = formatScopeName(s.trim());
-          if (t) set.add(t);
+        // Split by comma or plus
+        p.scopeOfWork.split(/[,+]/).forEach(s => {
+          const t = s.trim();
+          if (t && t !== "—") set.add(t);
         });
       }
     });
-    return Array.from(set);
-  }, [projects]);
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }, [projects, scopesData]);
 
   // Derive available years from projects
   const availableYears = useMemo(() => {
@@ -627,14 +951,13 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
   const statusFilterOptions = useMemo(() => [
     { value: "", label: "All Statuses" },
-    { value: "not_started", label: "Not Started" },
-    { value: "in_progress", label: "In Progress" },
-    { value: "pending_design_approval", label: "Pending Approval" },
-    { value: "required_data_pending", label: "Required Data Pending" },
-    { value: "in_revision", label: "In Revision" },
-    { value: "in_verification", label: "In Verification" },
-    { value: "delayed", label: "Delayed" },
-    { value: "completed", label: "Completed" }
+    { value: CANONICAL_PROJECT_STATUS.ASSIGNED, label: "Assigned" },
+    { value: CANONICAL_PROJECT_STATUS.IN_PROGRESS, label: "In Progress" },
+    { value: CANONICAL_PROJECT_STATUS.SUBMITTED, label: "Submitted" },
+    { value: CANONICAL_PROJECT_STATUS.UNDER_REVIEW, label: "Under Review" },
+    { value: CANONICAL_PROJECT_STATUS.REVISION_REQUESTED, label: "Revision Requested" },
+    { value: CANONICAL_PROJECT_STATUS.APPROVED, label: "Approved" },
+    { value: CANONICAL_PROJECT_STATUS.COMPLETED, label: "Completed" }
   ], []);
 
   const changeRequestOptions = useMemo(() => [
@@ -675,7 +998,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       // Column Header Filter: Scope
       if (filterScope) {
         const designerScopes = getDesignerAssignedScopes(project, lockedEmail);
-        const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+        const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
         const displayedScope = isOwnerOrAdmin
           ? (project.scopeOfWork || "")
           : (designerScopes.length > 0 ? designerScopes.join(", ") : (project.scopeOfWork || ""));
@@ -691,9 +1014,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
       // Column Header Filter: Status
       if (filterStatus) {
-        const pStatus = (project.status || "").toLowerCase();
-        const fStatus = filterStatus.toLowerCase();
-        if (pStatus !== fStatus) {
+        const pCanonical = normalizeProjectStatus(project.status);
+        if (pCanonical !== filterStatus) {
           return false;
         }
       }
@@ -784,25 +1106,77 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     return pages;
   }, [totalPages, safePage]);
 
-  // Dynamic Pricing Logic for Add Project
-  const selectedClientObj = approvedClients.find(c => c.id === newProject.clientId);
-  const activeCategory = selectedClientObj?.pricingCategory || "T1";
-  
-  const rulesForTier = pricingRules.filter((rule: any) => {
-    return rule.category === activeCategory;
-  });
-  
-  const availableScopes = Array.from(
-    new Set(rulesForTier.map((rule: any) => rule.scope))
-  ).filter(Boolean) as string[];
-  
-  const availableSubServices = Array.from(
-    new Set(
-      rulesForTier
-        .filter((rule: any) => rule.scope === newProject.scopeOfWork)
-        .map((rule: any) => rule.subService)
-    )
-  ).filter(Boolean) as string[];
+  // Pure dynamic list of Admin Console scopes (alphabetical, verbatim names from Admin Console)
+  const dynamicScopes = useMemo<string[]>(() => {
+    return scopesData.map(s => s.name);
+  }, [scopesData]);
+
+  const availableSubServices = useMemo(() => {
+    if (!newProject.scopeOfWork) return [];
+    const set = new Set<string>();
+    const selectedScopeLower = newProject.scopeOfWork.toLowerCase().trim();
+
+    // From scopesData (maps scopeDoc.subServices || scopeDoc.modules)
+    if (Array.isArray(scopesData)) {
+      const scopeDoc = scopesData.find(
+        (s: any) => s?.name && s.name.toLowerCase().trim() === selectedScopeLower
+      );
+      if (scopeDoc) {
+        const subs = scopeDoc.subServices || scopeDoc.modules;
+        if (Array.isArray(subs)) {
+          subs.forEach((sub: any) => {
+            const subName = typeof sub === 'string' ? sub.trim() : (sub?.name || sub?.title || sub?.label || "");
+            if (subName && typeof subName === 'string' && subName.trim()) {
+              set.add(subName.trim());
+            }
+          });
+        }
+      }
+    }
+
+    // From pricingRules
+    if (Array.isArray(pricingRules)) {
+      pricingRules.forEach((rule: any) => {
+        const ruleScope = (rule?.scope || rule?.name || "").toLowerCase().trim();
+        if (ruleScope === selectedScopeLower) {
+          if (rule?.subService && typeof rule.subService === 'string' && rule.subService.trim()) {
+            set.add(rule.subService.trim());
+          }
+          if (Array.isArray(rule?.subServices)) {
+            rule.subServices.forEach((sub: any) => {
+              if (typeof sub === 'string' && sub.trim()) set.add(sub.trim());
+            });
+          }
+        }
+      });
+    }
+
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }, [newProject.scopeOfWork, scopesData, pricingRules]);
+
+  const availableUpgradeSubServices = useMemo(() => {
+    if (!selectedScopeToAdd || selectedScopeToAdd === "CUSTOM") return [];
+    const set = new Set<string>();
+    const selectedScopeLower = selectedScopeToAdd.toLowerCase().trim();
+
+    if (Array.isArray(scopesData)) {
+      const scopeDoc = scopesData.find(
+        (s: any) => s?.name && s.name.toLowerCase().trim() === selectedScopeLower
+      );
+      if (scopeDoc) {
+        const subs = scopeDoc.subServices || scopeDoc.modules;
+        if (Array.isArray(subs)) {
+          subs.forEach((sub: any) => {
+            const subName = typeof sub === 'string' ? sub.trim() : (sub?.name || sub?.title || sub?.label || "");
+            if (subName && typeof subName === 'string' && subName.trim()) {
+              set.add(subName.trim());
+            }
+          });
+        }
+      }
+    }
+    return Array.from(set).filter(Boolean).sort((a, b) => a.localeCompare(b));
+  }, [selectedScopeToAdd, scopesData]);
 
   // Synchronize catalog of all projects from Firestore for real-time deduplication checking
   useEffect(() => {
@@ -848,7 +1222,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     }
 
     const enteredCapacity = Number(enteredCapStr);
-    if (isNaN(enteredCapacity) || enteredCapacity <= 0) {
+    if (isNaN(enteredCapacity) || enteredCapacity < 0) {
       return null;
     }
 
@@ -883,6 +1257,37 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     return null;
   }, [debouncedSearch, newProject.clientId, approvedClients, existingProjectsForDedupe]);
 
+  // Live preview of auto-generated project code and serial number (Directive 3)
+  const previewProjectCode = useMemo(() => {
+    if (!newProject.clientId) return null;
+    const client = approvedClients.find(c => c.id === newProject.clientId);
+    if (!client) return null;
+    const prefix = deriveClientCodePrefix(client.name);
+    const d = newProject.projectDate ? new Date(`${newProject.projectDate}T12:00:00`) : new Date();
+    const targetYear = isNaN(d.getTime()) ? new Date().getFullYear() : d.getFullYear();
+    const targetMonth = isNaN(d.getTime()) ? String(new Date().getMonth() + 1).padStart(2, '0') : String(d.getMonth() + 1).padStart(2, '0');
+    const ymStr = `${targetYear}-${targetMonth}`;
+
+    let maxSeq = 0;
+    const allKnown = [...projectsList, ...existingProjectsForDedupe];
+    allKnown.forEach(p => {
+      const pNum = p.projectNumber || p.srNumber || "";
+      if (pNum.includes(ymStr)) {
+        const match = pNum.match(/-(\d+)$/);
+        if (match) {
+          const seq = parseInt(match[1], 10);
+          if (!isNaN(seq) && seq > maxSeq) maxSeq = seq;
+        }
+      }
+      if (typeof p.srNo === 'number' && (p.date || p.projectDate || "").startsWith(ymStr)) {
+        if (p.srNo > maxSeq) maxSeq = p.srNo;
+      }
+    });
+
+    const nextSeq = maxSeq + 1;
+    return generateProjectCode(prefix, d, nextSeq);
+  }, [newProject.clientId, newProject.projectDate, approvedClients, projectsList, existingProjectsForDedupe]);
+
   const handleOpenUpgradeModal = (project: Project) => {
     setUpgradeProject(project);
     setNewScopesList([]);
@@ -909,22 +1314,22 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
     // Check if this scope is already in historical scopes
     const historical = getAllProjectScopes(upgradeProject);
-    const formattedProposed = formatScopeName(scopeName);
-    if (historical.some(h => formatScopeName(h.scope).toLowerCase() === formattedProposed.toLowerCase())) {
-      showToast(`The scope "${formattedProposed}" is already an assigned historical scope.`);
+    const proposedScope = scopeName;
+    if (historical.some(h => (h.scope || "").toLowerCase().trim() === proposedScope.toLowerCase().trim())) {
+      showToast(`The scope "${proposedScope}" is already an assigned historical scope.`);
       return;
     }
 
     // Check if already in staged list
-    if (newScopesList.some(s => formatScopeName(s.scope).toLowerCase() === formattedProposed.toLowerCase())) {
-      showToast(`The scope "${formattedProposed}" is already added in this upgrade session.`);
+    if (newScopesList.some(s => (s.scope || "").toLowerCase().trim() === proposedScope.toLowerCase().trim())) {
+      showToast(`The scope "${proposedScope}" is already added in this upgrade session.`);
       return;
     }
 
     setNewScopesList(prev => [
       ...prev,
       {
-        scope: formattedProposed,
+        scope: proposedScope,
         designerEmail: normalizeEmail(designerEmail),
         subService: selectedSubServiceForScope ? selectedSubServiceForScope.trim() : undefined
       }
@@ -933,7 +1338,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     setSelectedScopeToAdd("");
     setCustomScopeName("");
     setSelectedSubServiceForScope("");
-    showToast(`Added ${formattedProposed} to upgrade package.`);
+    showToast(`Added ${proposedScope} to upgrade package.`);
   };
 
   const handleRemoveScopeFromUpgrade = (index: number) => {
@@ -971,7 +1376,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       for (const item of newScopesList) {
         const scopeKey = getScopeKey(item.scope);
         updatePayload[`assignedScopes.${scopeKey}`] = item.designerEmail;
-        newScopeTitles.push(formatScopeName(item.scope));
+        newScopeTitles.push(item.scope.trim());
       }
 
       // Append new scope names to the high-level scopeOfWork string
@@ -983,12 +1388,18 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       const mergedScopes = Array.from(new Set([...currentScopesArr, ...newScopeTitles]));
       updatePayload[PROJECT_FIELDS.SCOPE_OF_WORK] = mergedScopes.join(", ");
 
-      // Execute update in Firestore
-      await updateDoc(doc(db, COLLECTIONS.PROJECTS, upgradeProject.id), updatePayload);
+      // Execute update in Firestore with existence verification guard
+      const projRef = doc(db, COLLECTIONS.PROJECTS, upgradeProject.id);
+      const projSnap = await getDoc(projRef);
+      if (!projSnap.exists()) {
+        showToast("Error: Project document does not exist in database.");
+        return;
+      }
+      await updateDoc(projRef, sanitizeFirestorePayload(updatePayload));
 
       // Add audit log entry
       try {
-        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
+        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), sanitizeFirestorePayload({
           action: "PROJECT_SCOPE_UPGRADE",
           actor: auth.currentUser?.email || lockedEmail,
           timestamp: serverTimestamp(),
@@ -1005,7 +1416,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
             previousScopeOfWork: currentScopesStr,
             newScopeOfWork: mergedScopes.join(", ")
           }
-        });
+        }));
       } catch (logErr) {
         console.warn("Could not write audit log for upgrade:", logErr);
       }
@@ -1023,9 +1434,10 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
   };
 
   useEffect(() => {
+    // Attach Firestore snapshot listeners when lockedEmail is verified
     if (!lockedEmail) return;
 
-    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
 
     // Phase 1 Split-Scope Data Filtering:
     // Update the Firestore query and frontend filter so the designer only sees projects
@@ -1038,12 +1450,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
         ...doc.data()
       })) as Project[];
 
-      // Phase 1 Split-Scope Data Filtering:
-      // Filter so a logged-in designer only sees projects where their email is assigned
-      // to at least one scope within the assignedScopes object (with safe fallback for legacy data)
-      if (!isOwnerOrAdmin) {
-        projData = projData.filter(project => isDesignerAssignedToProject(project, lockedEmail, false));
-      }
+      // Filter so the logged-in designer only sees projects where their email is assigned
+      // (Even if the user has owner or admin role, Designer Studio view strictly displays assigned projects)
+      projData = projData.filter(project => isDesignerAssignedToProject(project, lockedEmail, false));
       
       projData.sort((a, b) => {
         const diff = getProjectDateTimestamp(b) - getProjectDateTimestamp(a);
@@ -1100,73 +1509,134 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       setChangeRequests([]);
     });
 
-    const fetchScopes = async () => {
-      try {
-        const snap = await getDocs(collection(db, COLLECTIONS.SCOPES));
-        const uniqueScopes = Array.from(new Map(snap.docs.map(d => [d.data().name, d.data()])).values());
-        setScopesData(uniqueScopes as any);
-      } catch (err) {
-        console.error("Error fetching scopes", err);
-        setScopesData([]);
-      }
-    };
-    fetchScopes();
+    // Real-time listener for /scopes collection
+    const unsubscribeScopes = onSnapshot(collection(db, COLLECTIONS.SCOPES), (snapshot) => {
+      const items = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setRawScopes(items);
+    }, (error) => {
+      console.error("Error fetching scopes:", error);
+      setRawScopes([]);
+    });
+
+    // Real-time listener for /packages collection
+    const unsubscribePackages = onSnapshot(collection(db, "packages"), (snapshot) => {
+      const items = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setRawPackages(items);
+    }, (error) => {
+      console.error("Error fetching packages:", error);
+      setRawPackages([]);
+    });
 
     const fetchDesigners = async () => {
       try {
-        let designers: { email: string; name?: string; role?: string }[] = [];
+        const uniqueDesignersMap = new Map<string, { email: string; name?: string; role?: string }>();
         
+        // Helper to register designer record ensuring email deduplication and case normalization
+        const registerPerson = (person: { email: string; name?: string; role?: string }) => {
+          const cleanEmail = normalizeEmail(person.email);
+          if (!cleanEmail) return;
+          const existing = uniqueDesignersMap.get(cleanEmail);
+          if (!existing) {
+            uniqueDesignersMap.set(cleanEmail, {
+              email: person.email.trim(),
+              name: person.name?.trim() || person.email.trim(),
+              role: person.role?.trim() || ""
+            });
+          } else {
+            // Keep the record with the most complete name/role
+            if ((!existing.name || existing.name.toLowerCase() === existing.email.toLowerCase()) && person.name && person.name.toLowerCase() !== person.email.toLowerCase()) {
+              existing.name = person.name.trim();
+            }
+            if (!existing.role && person.role) {
+              existing.role = person.role.trim();
+            }
+          }
+        };
+
         // 1. Primary: employees collection (central directory in Master Blueprint)
         try {
           const empSnap = await getDocs(collection(db, COLLECTIONS.EMPLOYEES));
           if (!empSnap.empty) {
-            designers = empSnap.docs.map(d => {
+            empSnap.docs.forEach(d => {
               const data = d.data();
-              return {
+              registerPerson({
                 email: data.email || "",
                 name: data.name || data.displayName || data.email || "",
                 role: data.role || data.assignedRole || data.designation || data.department || ""
-              };
+              });
             });
           }
         } catch (e) {
           console.warn("Could not query employees for designers", e);
         }
 
-        // 2. Fallback: users collection (mirrored authentication profiles)
-        if (designers.length === 0) {
-          try {
-            const snap = await getDocs(collection(db, COLLECTIONS.USERS));
-            designers = snap.docs.map(d => {
-              const data = d.data();
-              return {
-                email: data.email || "",
-                name: data.name || data.displayName || data.email || "",
-                role: data.role || data.assignedRole || ""
-              };
+        // 2. Query users collection to ensure all staff, owners, and partners are included
+        try {
+          const snap = await getDocs(collection(db, COLLECTIONS.USERS));
+          snap.docs.forEach(d => {
+            const data = d.data();
+            registerPerson({
+              email: data.email || "",
+              name: data.name || data.displayName || data.email || "",
+              role: data.role || data.assignedRole || data.designation || ""
             });
-          } catch (e) {
-            console.warn("Could not query users for designers", e);
-          }
+          });
+        } catch (e) {
+          console.warn("Could not query users for designers", e);
         }
 
-        const filtered = designers.filter(u => {
-          if (!u.email || u.email.toLowerCase() === lockedEmail.toLowerCase()) return false;
-          const r = (u.role || "").toLowerCase();
-          return r.includes("designer") || r.includes("design") || r.includes("engineer") || r.includes("architect");
+        const normalizedLockedEmail = normalizeEmail(lockedEmail);
+
+        // Directive 4: Match staff whose role or designation is 'DESIGNER', 'LEAD_DESIGNER', or 'OWNER'
+        const isEligibleStaff = (roleStr: string) => {
+          const r = (roleStr || "").toUpperCase().trim();
+          return (
+            r === "DESIGNER" ||
+            r === "LEAD_DESIGNER" ||
+            r === "OWNER" ||
+            r.includes("DESIGNER") ||
+            r.includes("LEAD_DESIGNER") ||
+            r.includes("OWNER") ||
+            r.includes("PARTNER") ||
+            r.includes("ENGINEER") ||
+            r.includes("ARCHITECT")
+          );
+        };
+
+        // Filter peer designers for transfer project dropdown
+        const peerDesigners: { email: string; name?: string; role?: string }[] = [];
+        uniqueDesignersMap.forEach((u, cleanEmail) => {
+          if (cleanEmail === normalizedLockedEmail) return;
+          if (isEligibleStaff(u.role || "")) {
+            peerDesigners.push(u);
+          }
         });
-        setDesignersList(filtered);
+        setDesignersList(peerDesigners);
 
         // Populate full assignees list for split-scope assignments including current user
-        const assignees = designers.filter(u => !!u.email);
-        if (!assignees.some(u => u.email.toLowerCase() === lockedEmail.toLowerCase())) {
-          assignees.unshift({
-            email: lockedEmail,
-            name: auth.currentUser?.displayName || "You",
-            role: "designer"
+        const allAssignees: { email: string; name?: string; role?: string }[] = [];
+        // Ensure current user is at the top exactly once
+        if (normalizedLockedEmail) {
+          const self = uniqueDesignersMap.get(normalizedLockedEmail);
+          allAssignees.push({
+            email: lockedEmail.trim(),
+            name: self?.name || auth.currentUser?.displayName || "You",
+            role: self?.role || "designer"
           });
         }
-        setAllAssigneesList(assignees);
+
+        uniqueDesignersMap.forEach((u, cleanEmail) => {
+          if (cleanEmail !== normalizedLockedEmail) {
+            allAssignees.push(u);
+          }
+        });
+        setAllAssigneesList(allAssignees);
       } catch (err) {
         console.error("Error fetching designers", err);
         setDesignersList([]);
@@ -1182,13 +1652,20 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
           where("status", "==", CLIENT_STATUS.APPROVED)
         );
         const snap = await getDocs(q);
-        const clients = snap.docs.map(d => ({
-          id: d.id,
-          name: d.data().companyName || d.data().contactPerson || "Unknown Client",
-          salesPersonEmail: d.data().salesPersonEmail || "",
-          pricingCategory: d.data().pricingCategory || "T1"
-        }));
-        setApprovedClients(clients);
+        const clientsMap = new Map<string, any>();
+        snap.docs.forEach(d => {
+          const data = d.data();
+          const id = d.id;
+          if (!clientsMap.has(id)) {
+            clientsMap.set(id, {
+              id: id,
+              name: data.companyName || data.contactPerson || "Unknown Client",
+              salesPersonEmail: data.salesPersonEmail || "",
+              pricingCategory: data.pricingCategory || "T1"
+            });
+          }
+        });
+        setApprovedClients(Array.from(clientsMap.values()));
       } catch (err) {
         console.error("Error fetching clients", err);
         setApprovedClients([]);
@@ -1210,12 +1687,14 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     return () => {
       unsubscribeProjects();
       unsubscribeCRs();
+      unsubscribeScopes();
+      unsubscribePackages();
       unsubscribePricingRules();
     };
   }, [lockedEmail, userRole]);
 
   const handleStatusChange = async (projectId: string, newStatus: string) => {
-    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
     const project = activeProjectsList.concat(completedProjectsList).find(p => p.id === projectId);
     const isAssigned = project && isDesignerAssignedToProject(project, lockedEmail, isOwnerOrAdmin);
 
@@ -1224,20 +1703,30 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       return;
     }
 
+    const canonicalStatus = normalizeProjectStatus(newStatus);
+
     try {
-      await updateDoc(doc(db, COLLECTIONS.PROJECTS, projectId), {
-        [PROJECT_FIELDS.STATUS]: newStatus,
-        [PROJECT_FIELDS.UPDATED_AT]: new Date()
-      });
+      // Guard write: verify project document existence before committing update
+      const projectRef = doc(db, COLLECTIONS.PROJECTS, projectId);
+      const projectSnap = await getDoc(projectRef);
+      if (!projectSnap.exists()) {
+        showToast("Error: Project document does not exist in database.");
+        return;
+      }
+
+      await updateDoc(projectRef, sanitizeFirestorePayload({
+        [PROJECT_FIELDS.STATUS]: canonicalStatus,
+        [PROJECT_FIELDS.UPDATED_AT]: serverTimestamp()
+      }));
 
       // Audit Trail logging for design completions and milestone status updates
-      if (newStatus === PROJECT_STATUS.COMPLETED || newStatus === PROJECT_STATUS.DESIGN_APPROVED) {
+      if (canonicalStatus === CANONICAL_PROJECT_STATUS.COMPLETED || canonicalStatus === CANONICAL_PROJECT_STATUS.APPROVED) {
         try {
           const myScopes = getDesignerAssignedScopes(project, lockedEmail);
           const activeScopeLabel = myScopes.length > 0 ? myScopes.join(", ") : (project.scopeOfWork || "Design Phase");
 
-          await addDoc(collection(db, "auditLogs"), {
-            action: newStatus === PROJECT_STATUS.COMPLETED ? "DESIGN_COMPLETED" : "DESIGN_APPROVED",
+          await addDoc(collection(db, "auditLogs"), sanitizeFirestorePayload({
+            action: canonicalStatus === CANONICAL_PROJECT_STATUS.COMPLETED ? "DESIGN_COMPLETED" : "DESIGN_APPROVED",
             actor: lockedEmail,
             target: project.projectName || project.projectNumber || project.srNumber || projectId,
             details: {
@@ -1247,19 +1736,19 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
               scopeOfWork: activeScopeLabel,
               subService: project.subService || "N/A",
               moduleMilestone: activeScopeLabel,
-              commissionMilestoneLocked: newStatus === PROJECT_STATUS.COMPLETED,
-              plantCapacity: project.plantCapacity ? `${project.plantCapacity} kW` : "N/A",
+              commissionMilestoneLocked: canonicalStatus === CANONICAL_PROJECT_STATUS.COMPLETED,
+              plantCapacity: formatCapacity(project.plantCapacity, project.capacityUnit || "kW"),
               previousStatus: project.status,
-              newStatus: newStatus
+              newStatus: canonicalStatus
             },
             timestamp: new Date().toISOString()
-          });
+          }));
         } catch (auditErr) {
           console.warn("Could not log status update to auditLogs:", auditErr);
         }
       }
 
-      showToast(`Status updated to ${newStatus}`);
+      showToast(`Status updated to ${STATUS_LABELS[canonicalStatus] || canonicalStatus}`);
     } catch (error) {
       console.error("Error updating status:", error);
       showToast("Error updating status");
@@ -1283,7 +1772,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
     try {
       // 1. Audit Trail: Log completed design export strictly according to Master Database Blueprint
-      await addDoc(collection(db, "auditLogs"), {
+      await addDoc(collection(db, "auditLogs"), sanitizeFirestorePayload({
         action: "DESIGN_EXPORT_COMPLETED",
         actor: lockedEmail,
         target: exportProject.projectName || exportProject.projectNumber || exportProject.srNumber || exportProject.id,
@@ -1296,12 +1785,19 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
           subService: exportProject.subService || "N/A",
           moduleMilestone: activeExportScope,
           commissionMilestoneLocked: true,
-          plantCapacity: exportProject.plantCapacity ? `${exportProject.plantCapacity} kW` : "N/A",
+          plantCapacity: formatCapacity(exportProject.plantCapacity, exportProject.capacityUnit || "kW"),
           designerEmail: exportProject.designerEmail || lockedEmail,
           format: "Technical Engineering Specification"
         },
         timestamp: new Date().toISOString()
-      });
+      }));
+
+      const exportFileName = `${(exportProject.projectNumber || exportProject.projectName || "solar_design").replace(/[^a-zA-Z0-9_-]/g, "_")}_${exportType}.json`;
+      const validation = validateDeliverableFile(exportFileName);
+      if (!validation.valid) {
+        showToast(validation.error || "Invalid file format");
+        return;
+      }
 
       // 2. Generate and trigger download of the design export package
       const fileData = {
@@ -1313,9 +1809,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
         projectName: exportProject.projectName || "N/A",
         scopeOfWork: activeExportScope,
         subService: exportProject.subService || "N/A",
-        plantCapacity: exportProject.plantCapacity ? `${exportProject.plantCapacity} kW` : "N/A",
+        plantCapacity: formatCapacity(exportProject.plantCapacity, exportProject.capacityUnit || "kW"),
         designerEmail: exportProject.designerEmail || lockedEmail,
-        status: exportProject.status || "N/A",
+        status: normalizeProjectStatus(exportProject.status),
         exportedAt: new Date().toISOString(),
         solarithmHub: "solarithm-master"
       };
@@ -1324,7 +1820,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${(exportProject.projectNumber || exportProject.projectName || "solar_design").replace(/[^a-zA-Z0-9_-]/g, "_")}_${exportType}.json`;
+      link.download = exportFileName;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -1345,11 +1841,17 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     e.preventDefault();
     if (!selectedProject || !changeValue || !changeReason || !lockedEmail) return;
 
-    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
     const isAssigned = isDesignerAssignedToProject(selectedProject, lockedEmail, isOwnerOrAdmin);
 
     if (!isAssigned) {
       showToast("Unauthorized: You can only submit requests for your own projects or assigned scopes.");
+      return;
+    }
+
+    // RBAC: Designers are strictly restricted from modifying financial settlements, commission matrices, or owner settings
+    if (!isOwnerOrAdmin && isDesignerRestrictedField(changeField)) {
+      showToast("Access Denied: Designers cannot modify financial settlements, commission matrices, or pricing rules.");
       return;
     }
 
@@ -1362,18 +1864,18 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
         }
       }
       
-      await addDoc(collection(db, COLLECTIONS.CHANGE_REQUESTS), {
+      await addDoc(collection(db, COLLECTIONS.CHANGE_REQUESTS), sanitizeFirestorePayload({
         projectId: selectedProject.id || "",
         projectNumber: (selectedProject as any).projectNumber || "N/A",
         clientName: toTitleCase((selectedProject as any).clientName || "N/A"),
         fieldToChange: changeField || "",
-        currentValue: currentValue !== undefined ? currentValue : null,
-        requestedValue: changeValue !== undefined ? changeValue : null,
+        currentValue: currentValue !== undefined && currentValue !== null ? currentValue : null,
+        requestedValue: changeValue !== undefined && changeValue !== null ? changeValue : null,
         reason: changeReason || "",
         requestedBy: lockedEmail || "",
         status: 'pending',
         createdAt: serverTimestamp()
-      });
+      }));
 
       setIsModalOpen(false);
       setSelectedProject(null);
@@ -1391,7 +1893,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
     if (!transferProject || !targetDesignerEmail) return;
     setIsTransferring(true);
 
-    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
     const targetEmailClean = normalizeEmail(targetDesignerEmail);
     const sourceEmailClean = normalizeEmail(lockedEmail);
 
@@ -1430,11 +1932,18 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
         }
       }
 
-      await updateDoc(doc(db, COLLECTIONS.PROJECTS, transferProject.id), updateData);
+      const projRef = doc(db, COLLECTIONS.PROJECTS, transferProject.id);
+      const projSnap = await getDoc(projRef);
+      if (!projSnap.exists()) {
+        showToast("Error: Project document does not exist in database.");
+        return;
+      }
+
+      await updateDoc(projRef, sanitizeFirestorePayload(updateData));
 
       // Audit log entry
       try {
-        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
+        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), sanitizeFirestorePayload({
           action: "PROJECT_TRANSFERRED",
           actor: lockedEmail,
           target: transferProject.projectName || transferProject.projectNumber || transferProject.id,
@@ -1447,7 +1956,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
             transferredAt: new Date().toISOString()
           },
           timestamp: serverTimestamp()
-        });
+        }));
       } catch (logErr) {
         console.warn("Could not log project transfer to auditLogs:", logErr);
       }
@@ -1489,30 +1998,87 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
       const projectDateObj = new Date(`${selectedDate}T12:00:00`);
       const projectTimestamp = Timestamp.fromDate(projectDateObj);
 
+      // Directive 3: Calculate next sequential serial number (srNo) and formatted project code
+      const targetYear = isNaN(projectDateObj.getTime()) ? new Date().getFullYear() : projectDateObj.getFullYear();
+      const targetMonth = isNaN(projectDateObj.getTime()) ? String(new Date().getMonth() + 1).padStart(2, '0') : String(projectDateObj.getMonth() + 1).padStart(2, '0');
+      const ymStr = `${targetYear}-${targetMonth}`;
+
+      let maxSeq = 0;
+      // 1. Inspect all in-memory projects
+      const allKnown = [...projectsList, ...existingProjectsForDedupe];
+      allKnown.forEach(p => {
+        const pNum = p.projectNumber || p.srNumber || "";
+        if (pNum.includes(ymStr)) {
+          const match = pNum.match(/-(\d+)$/);
+          if (match) {
+            const seq = parseInt(match[1], 10);
+            if (!isNaN(seq) && seq > maxSeq) maxSeq = seq;
+          }
+        }
+        if (typeof p.srNo === 'number' && (p.date || p.projectDate || "").startsWith(ymStr)) {
+          if (p.srNo > maxSeq) maxSeq = p.srNo;
+        }
+      });
+
+      // 2. Real-time query to Firestore projects collection to guard against race conditions
+      try {
+        const snap = await getDocs(collection(db, COLLECTIONS.PROJECTS));
+        snap.docs.forEach(docSnap => {
+          const dData = docSnap.data();
+          const pNum = dData.projectNumber || dData.srNumber || "";
+          if (pNum.includes(ymStr)) {
+            const match = pNum.match(/-(\d+)$/);
+            if (match) {
+              const seq = parseInt(match[1], 10);
+              if (!isNaN(seq) && seq > maxSeq) maxSeq = seq;
+            }
+          }
+          if (typeof dData.srNo === 'number' && (dData.date || dData.projectDate || "").startsWith(ymStr)) {
+            if (dData.srNo > maxSeq) maxSeq = dData.srNo;
+          }
+        });
+      } catch (err) {
+        console.warn("Could not query projects collection for max seq", err);
+      }
+
+      const nextSrNo = maxSeq + 1;
+      const clientPrefix = deriveClientCodePrefix(clientName);
+      const { projectNumber: generatedProjectNumber } = generateProjectCode(clientPrefix, projectDateObj, nextSrNo);
+
       const projData = {
         [PROJECT_FIELDS.CLIENT_ID]: newProject.clientId,
         [PROJECT_FIELDS.CLIENT_NAME]: toTitleCase(clientName),
         [PROJECT_FIELDS.PROJECT_NAME]: toTitleCase(newProject.projectName),
+        [PROJECT_FIELDS.PROJECT_NUMBER]: generatedProjectNumber,
+        [PROJECT_FIELDS.SR_NUMBER]: generatedProjectNumber,
+        [PROJECT_FIELDS.SR_NO]: nextSrNo,
         [PROJECT_FIELDS.PLANT_CAPACITY]: Number(newProject.plantCapacity),
         [PROJECT_FIELDS.CAPACITY_UNIT]: newProject.capacityUnit,
-        [PROJECT_FIELDS.SCOPE_OF_WORK]: toTitleCase(newProject.scopeOfWork),
-        [PROJECT_FIELDS.SUB_SERVICE]: toTitleCase(newProject.subService),
+        [PROJECT_FIELDS.SCOPE_OF_WORK]: newProject.scopeOfWork.trim(),
+        [PROJECT_FIELDS.SUB_SERVICE]: newProject.subService ? newProject.subService.trim() : "",
         [PROJECT_FIELDS.LOCATION]: toTitleCase(newProject.location),
         [PROJECT_FIELDS.DESIGNER_EMAIL]: currentEmail,
         assignedScopes: {
           [initialScopeKey]: currentEmail
         },
         [PROJECT_FIELDS.SALES_PERSON_EMAIL]: salesPersonEmail,
-        [PROJECT_FIELDS.STATUS]: PROJECT_STATUS.NOT_STARTED,
+        [PROJECT_FIELDS.STATUS]: CANONICAL_PROJECT_STATUS.ASSIGNED,
         date: selectedDate,
         projectDate: selectedDate,
         [PROJECT_FIELDS.CREATED_AT]: projectTimestamp,
         [PROJECT_FIELDS.UPDATED_AT]: serverTimestamp()
       };
 
-      await addDoc(collection(db, COLLECTIONS.PROJECTS), projData);
+      const docRef = await addDoc(collection(db, COLLECTIONS.PROJECTS), sanitizeFirestorePayload(projData));
       
-      showToast("Project added successfully!");
+      const createdProjectObj: Project = {
+        id: docRef.id,
+        ...projData,
+        hasPendingChange: false
+      } as any;
+      setProjectsList((prev) => [createdProjectObj, ...prev.filter(p => p.id !== docRef.id)]);
+      
+      showToast(`Project ${generatedProjectNumber} created successfully!`);
       setIsAddProjectModalOpen(false);
       setNewProject({
         clientId: "",
@@ -1547,12 +2113,12 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
   const totalProjects = activeProjectsList.length + completedProjectsList.length;
   const pendingProjects = activeProjectsList.filter(p => {
-    const s = (p.status || "").toLowerCase();
-    return s === "not_started" || s === "not started" || s === "pending";
+    const s = normalizeProjectStatus(p.status);
+    return s === CANONICAL_PROJECT_STATUS.ASSIGNED || s === CANONICAL_PROJECT_STATUS.SUBMITTED;
   }).length;
   const inProgressProjects = activeProjectsList.filter(p => {
-    const s = (p.status || "").toLowerCase();
-    return s === "in_progress" || s === "in progress" || s === "in_revision" || s === "in revision";
+    const s = normalizeProjectStatus(p.status);
+    return s === CANONICAL_PROJECT_STATUS.IN_PROGRESS || s === CANONICAL_PROJECT_STATUS.UNDER_REVIEW || s === CANONICAL_PROJECT_STATUS.REVISION_REQUESTED;
   }).length;
   const completedProjects = completedProjectsList.length;
 
@@ -1594,7 +2160,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
           <ThemeToggle />
           <div className="hidden lg:flex flex-col items-end">
             <span className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-semibold tracking-wider">
-              {userRole === 'owner' ? 'Owner / Production Admin' : userRole === 'admin' ? 'Admin' : 'Designer'}
+              {userRole === 'owner' ? 'Owner / Production Admin' : userRole === 'admin' ? 'Admin' : userRole === 'lead_designer' ? 'Lead Designer' : 'Designer'}
             </span>
             <span className="text-[#D4AF37] font-medium leading-none">{lockedEmail}</span>
           </div>
@@ -1646,7 +2212,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
               <p className="text-sm font-medium text-[#D4AF37] truncate mt-0.5">{lockedEmail}</p>
               <div className="mt-2 flex items-center gap-2">
                 <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-white dark:bg-[#2A2A2A] text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-[#333333] uppercase">
-                  {userRole || 'Designer'}
+                  {userRole === 'lead_designer' ? 'Lead Designer' : (userRole || 'Designer')}
                 </span>
               </div>
             </div>
@@ -1751,7 +2317,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
             <div className="w-full max-w-full space-y-8 flex-1">
               {/* Welcome Section */}
               <div>
-                <h2 className="text-2xl font-sans font-bold text-gray-900 dark:text-white">{getGreeting()}, {userName} 👋</h2>
+                <h2 className="text-2xl font-sans font-bold text-gray-900 dark:text-white">
+                  {getGreeting()}, {userName || toTitleCase(lockedEmail.split('@')[0].replace(/[._0-9]+/g, ' ').trim()) || "Designer"} 👋
+                </h2>
                 <p className="text-gray-600 dark:text-gray-400 mt-1">Here is your project overview for today.</p>
               </div>
 
@@ -1860,7 +2428,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       )}
                       {filterScope && (
                         <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-white dark:bg-[#2A2A2A] border border-amber-500/40 text-gray-800 dark:text-gray-200 shadow-xs">
-                          <span>Scope: <strong className="text-[#D4AF37]">{toTitleCase(filterScope)}</strong></span>
+                          <span>Scope: <strong className="text-[#D4AF37]">{formatScopeDisplay(filterScope, scopesData, pricingRules)}</strong></span>
                           <button onClick={() => setFilterScope("")} className="hover:text-rose-500 cursor-pointer ml-0.5"><X className="w-3 h-3" /></button>
                         </span>
                       )}
@@ -2002,9 +2570,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                     <span>All Clients ({uniqueClients.length})</span>
                                     {!filterClient && <Check className="w-3.5 h-3.5" />}
                                   </button>
-                                  {filteredUniqueClients.map((client) => (
+                                  {filteredUniqueClients.map((client, idx) => (
                                     <button
-                                      key={client}
+                                      key={`filter-client-${client}-${idx}`}
                                       onClick={() => {
                                         setFilterClient(client);
                                         setOpenFilterHeader(null);
@@ -2074,9 +2642,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                     <span>All Scopes</span>
                                     {!filterScope && <Check className="w-3.5 h-3.5" />}
                                   </button>
-                                  {uniqueScopes.map((scope) => (
+                                  {uniqueScopes.map((scope, idx) => (
                                     <button
-                                      key={scope}
+                                      key={`filter-scope-${scope}-${idx}`}
                                       onClick={() => {
                                         setFilterScope(scope);
                                         setOpenFilterHeader(null);
@@ -2146,8 +2714,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                       className="w-full px-2.5 py-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] rounded-md text-xs text-gray-900 dark:text-white outline-none focus:border-[#D4AF37]"
                                     >
                                       <option value="">All Years</option>
-                                      {availableYears.map(yr => (
-                                        <option key={yr} value={yr}>{yr}</option>
+                                      {availableYears.map((yr, idx) => (
+                                        <option key={`filter-yr-${yr}-${idx}`} value={yr}>{yr}</option>
                                       ))}
                                     </select>
                                   </div>
@@ -2160,8 +2728,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                       onChange={(e) => setFilterDateMonth(e.target.value)}
                                       className="w-full px-2.5 py-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] rounded-md text-xs text-gray-900 dark:text-white outline-none focus:border-[#D4AF37]"
                                     >
-                                      {monthOptions.map(m => (
-                                        <option key={m.value} value={m.value}>{m.label}</option>
+                                      {monthOptions.map((m, idx) => (
+                                        <option key={`filter-m-${m.value}-${idx}`} value={m.value}>{m.label}</option>
                                       ))}
                                     </select>
                                   </div>
@@ -2213,9 +2781,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                   )}
                                 </div>
                                 <div className="max-h-56 overflow-y-auto space-y-0.5">
-                                  {statusFilterOptions.map((st) => (
+                                  {statusFilterOptions.map((st, idx) => (
                                     <button
-                                      key={st.value}
+                                      key={`filter-status-${st.value}-${idx}`}
                                       onClick={() => {
                                         setFilterStatus(st.value);
                                         setOpenFilterHeader(null);
@@ -2270,9 +2838,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                   )}
                                 </div>
                                 <div className="space-y-0.5">
-                                  {changeRequestOptions.map((opt) => (
+                                  {changeRequestOptions.map((opt, idx) => (
                                     <button
-                                      key={opt.value}
+                                      key={`filter-cr-${opt.value}-${idx}`}
                                       onClick={() => {
                                         setFilterChangeRequest(opt.value);
                                         setOpenFilterHeader(null);
@@ -2297,15 +2865,15 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       </thead>
                       
                       <tbody className="divide-y divide-gray-100 dark:divide-[#2A2A2A]">
-                        {paginatedProjects.map((project) => {
+                        {paginatedProjects.map((project, pIdx) => {
                           const designerScopes = getDesignerAssignedScopes(project, lockedEmail);
-                          const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+                          const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
                           const displayedScope = isOwnerOrAdmin
                             ? (project.scopeOfWork || "—")
                             : (designerScopes.length > 0 ? designerScopes.join(", ") : (project.scopeOfWork || "—"));
 
                           return (
-                          <tr key={project.id} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors border-b border-gray-100 dark:border-[#2A2A2A]">
+                          <tr key={`project-${project.id || pIdx}`} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors border-b border-gray-100 dark:border-[#2A2A2A]">
                             <td className="px-5 py-4 align-top">
                               <button
                                 onClick={() => {
@@ -2346,13 +2914,13 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                             
                             <td className="px-5 py-4 align-top">
                               <span className="text-gray-800 dark:text-gray-200 bg-gray-100 dark:bg-[#2A2A2A] px-2 py-1 rounded text-sm font-medium inline-block w-fit">
-                                {project.plantCapacity ? `${project.plantCapacity} kW` : "TBD"}
+                                {formatCapacity(project.plantCapacity, project.capacityUnit || "kW")}
                               </span>
                             </td>
                             
                             <td className="px-5 py-4 align-top pr-2">
-                              <p className="text-base text-gray-800 dark:text-gray-200 line-clamp-2" title={displayedScope}>
-                                {toTitleCase(displayedScope)}
+                              <p className="text-base text-gray-800 dark:text-gray-200 line-clamp-2" title={formatScopeDisplay(displayedScope, scopesData, pricingRules)}>
+                                {formatScopeDisplay(displayedScope, scopesData, pricingRules)}
                               </p>
                             </td>
                             
@@ -2372,17 +2940,17 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                             
                             <td className="px-5 py-4 align-top">
                               <select
-                                value={project.status}
+                                value={normalizeProjectStatus(project.status)}
                                 onChange={(e) => handleStatusChange(project.id, e.target.value)}
                                 className={`text-sm font-medium rounded-md px-3 py-2 border border-gray-300 dark:border-[#333333] appearance-none cursor-pointer outline-none focus:ring-0 w-full ${getStatusColor(project.status)}`}
                               >
-                                <option value="not_started" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Not Started</option>
-                                <option value="in_progress" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Progress</option>
-                                <option value="required_data_pending" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Required Data Pending</option>
-                                <option value="in_revision" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Revision</option>
-                                <option value="in_verification" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Verification</option>
-                                <option value="delayed" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Delayed</option>
-                                <option value="completed" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Completed</option>
+                                <option value={CANONICAL_PROJECT_STATUS.ASSIGNED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Assigned</option>
+                                <option value={CANONICAL_PROJECT_STATUS.IN_PROGRESS} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Progress</option>
+                                <option value={CANONICAL_PROJECT_STATUS.SUBMITTED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Submitted</option>
+                                <option value={CANONICAL_PROJECT_STATUS.UNDER_REVIEW} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Under Review</option>
+                                <option value={CANONICAL_PROJECT_STATUS.REVISION_REQUESTED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Revision Requested</option>
+                                <option value={CANONICAL_PROJECT_STATUS.APPROVED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Approved</option>
+                                <option value={CANONICAL_PROJECT_STATUS.COMPLETED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Completed</option>
                               </select>
                             </td>
 
@@ -2544,8 +3112,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100 dark:divide-[#2A2A2A]">
-                        {changeRequests.map((req) => (
-                          <tr key={req.id} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors border-b border-gray-100 dark:border-[#2A2A2A]">
+                        {changeRequests.map((req, rIdx) => (
+                          <tr key={`cr-${req.id || rIdx}`} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors border-b border-gray-100 dark:border-[#2A2A2A]">
                             <td className="px-6 py-4 align-middle">
                               <span className="text-base font-medium text-gray-900 dark:text-gray-200 break-words">{req.projectNumber}</span>
                               <p className="text-gray-500 dark:text-gray-400 text-sm mt-0.5 truncate max-w-[150px]">{toTitleCase(req.clientName)}</p>
@@ -2591,7 +3159,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
 
       {/* Project Details Modal */}
       {isDetailsModalOpen && detailsProject && (() => {
-        const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+        const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
         const assignedScopesList = getDesignerAssignedScopes(detailsProject, lockedEmail);
         
         return (
@@ -2657,7 +3225,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                   </span>
                                 </div>
                                 <span className="text-sm font-bold text-gray-900 dark:text-white">
-                                  {toTitleCase(scopeItem)}
+                                  {formatScopeDisplay(scopeItem, scopesData, pricingRules)}
                                 </span>
                               </div>
                             </div>
@@ -2680,7 +3248,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                                 </span>
                               </div>
                               <span className="text-sm font-bold text-gray-900 dark:text-white">
-                                {toTitleCase(detailsProject.scopeOfWork || "Design Engineering")}
+                                {formatScopeDisplay(detailsProject.scopeOfWork || "Design Engineering", scopesData, pricingRules)}
                               </span>
                             </div>
                           </div>
@@ -2699,7 +3267,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       <div className="bg-white dark:bg-[#1E1E1E] p-3 rounded-lg border border-gray-200 dark:border-[#333333]">
                         <p className="text-xs text-gray-500 dark:text-gray-400 font-medium">All Project Scopes</p>
                         <p className="text-sm font-semibold text-gray-900 dark:text-white mt-0.5">
-                          {toTitleCase(detailsProject.scopeOfWork || "—")}
+                          {formatScopeDisplay(detailsProject.scopeOfWork || "—", scopesData, pricingRules)}
                         </p>
                       </div>
                       {detailsProject.assignedScopes && typeof detailsProject.assignedScopes === 'object' && (
@@ -2713,7 +3281,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                             return (
                               <div key={sIdx} className="flex justify-between items-center text-xs py-1 border-b border-gray-100 dark:border-[#2A2A2A] last:border-none">
                                 <span className="font-medium text-gray-800 dark:text-gray-200 flex items-center gap-2">
-                                  {toTitleCase(sKey)}
+                                  {formatScopeDisplay(sKey, scopesData, pricingRules)}
                                   {isMyScope && (
                                     <span className="text-[10px] font-semibold text-[#D4AF37] bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 rounded">
                                       Your Scope
@@ -2742,7 +3310,14 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                   <div className="bg-gray-50 dark:bg-[#252525] p-3 rounded-lg border border-gray-200 dark:border-[#333333]">
                     <span className="text-xs text-gray-500 dark:text-gray-400 block font-medium">Plant Capacity</span>
                     <span className="text-sm font-semibold text-[#D4AF37] mt-0.5 block">
-                      {detailsProject.plantCapacity ? `${detailsProject.plantCapacity} kW` : "TBD"}
+                      {formatCapacity(detailsProject.plantCapacity, detailsProject.capacityUnit || "kW")}
+                    </span>
+                  </div>
+
+                  <div className="bg-gray-50 dark:bg-[#252525] p-3 rounded-lg border border-gray-200 dark:border-[#333333]">
+                    <span className="text-xs text-gray-500 dark:text-gray-400 block font-medium">Market Sector</span>
+                    <span className="text-sm font-semibold text-gray-900 dark:text-white mt-0.5 block">
+                      {toTitleCase(detailsProject.projectSector || "Commercial")}
                     </span>
                   </div>
 
@@ -2781,20 +3356,21 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     Current Milestone Status
                   </label>
                   <select
-                    value={detailsProject.status}
+                    value={normalizeProjectStatus(detailsProject.status)}
                     onChange={(e) => {
-                      handleStatusChange(detailsProject.id, e.target.value);
-                      setDetailsProject({ ...detailsProject, status: e.target.value });
+                      const canonical = normalizeProjectStatus(e.target.value);
+                      handleStatusChange(detailsProject.id, canonical);
+                      setDetailsProject({ ...detailsProject, status: canonical });
                     }}
                     className={`w-full text-sm font-medium rounded-md px-3 py-2.5 border border-gray-300 dark:border-[#333333] cursor-pointer outline-none focus:ring-0 ${getStatusColor(detailsProject.status)}`}
                   >
-                    <option value="not_started" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Not Started</option>
-                    <option value="in_progress" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Progress</option>
-                    <option value="required_data_pending" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Required Data Pending</option>
-                    <option value="in_revision" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Revision</option>
-                    <option value="in_verification" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Verification</option>
-                    <option value="delayed" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Delayed</option>
-                    <option value="completed" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Completed</option>
+                    <option value={CANONICAL_PROJECT_STATUS.ASSIGNED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Assigned</option>
+                    <option value={CANONICAL_PROJECT_STATUS.IN_PROGRESS} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">In Progress</option>
+                    <option value={CANONICAL_PROJECT_STATUS.SUBMITTED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Submitted</option>
+                    <option value={CANONICAL_PROJECT_STATUS.UNDER_REVIEW} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Under Review</option>
+                    <option value={CANONICAL_PROJECT_STATUS.REVISION_REQUESTED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Revision Requested</option>
+                    <option value={CANONICAL_PROJECT_STATUS.APPROVED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Approved</option>
+                    <option value={CANONICAL_PROJECT_STATUS.COMPLETED} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Completed</option>
                   </select>
                 </div>
               </div>
@@ -2917,7 +3493,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       className="w-full px-3 py-2 bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md focus:ring-0 focus-within:border-[#D4AF37] focus:border-[#D4AF37] outline-none text-xs sm:text-sm"
                     >
                       <option value="">Select Scope</option>
-                      {scopesData.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                      {scopesData.map((s, idx) => <option key={`scope-opt-${s.name}-${idx}`} value={s.name}>{s.name}</option>)}
                     </select>
                   ) : changeField === 'subService' ? (
                     <select
@@ -2928,7 +3504,15 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     >
                       <option value="">Select Sub-Service</option>
                       <option value="N/A">N/A</option>
-                      {scopesData.find(s => s.name === selectedProject.scopeOfWork)?.subServices.map(sub => <option key={sub} value={sub}>{sub}</option>)}
+                      {(() => {
+                        const targetScope = (selectedProject?.scopeOfWork || "").toLowerCase().trim();
+                        const sDoc = scopesData.find(s => s.name.toLowerCase().trim() === targetScope);
+                        const subs = sDoc ? (sDoc.subServices || sDoc.modules || []) : [];
+                        return subs.map((sub: any, sIdx: number) => {
+                          const subName = typeof sub === 'string' ? sub : (sub?.name || sub?.title || "");
+                          return <option key={`sub-${subName}-${sIdx}`} value={subName}>{subName}</option>;
+                        });
+                      })()}
                     </select>
                   ) : (
                     <input 
@@ -3002,11 +3586,30 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     className="w-full p-2 bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs sm:text-sm"
                   >
                     <option value="">-- Choose Client --</option>
-                    {approvedClients.map(c => (
-                      <option key={c.id} value={c.id}>{c.name}</option>
+                    {approvedClients.map((c, idx) => (
+                      <option key={`client-opt-${c.id || idx}`} value={c.id}>{c.name}</option>
                     ))}
                   </select>
                 </div>
+
+                {previewProjectCode && (
+                  <div className="sm:col-span-2 flex flex-col sm:flex-row sm:items-center justify-between px-3.5 py-2 bg-amber-500/10 border border-[#D4AF37]/40 rounded-lg text-xs gap-1.5">
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
+                      <span className="font-semibold text-gray-800 dark:text-gray-200">
+                        Auto-Assigned Project Number:
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-bold text-sm text-[#D4AF37] bg-white/70 dark:bg-[#121212] px-2 py-0.5 rounded border border-[#D4AF37]/30">
+                        {previewProjectCode.projectNumber}
+                      </span>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400 font-mono">
+                        (Sr #{previewProjectCode.srNo})
+                      </span>
+                    </div>
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-xs sm:text-sm font-medium text-gray-700 dark:text-gray-200 mb-1">Project Name (Site) *</label>
@@ -3094,9 +3697,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                             {duplicateProject.location ? ` (${toTitleCase(duplicateProject.location)})` : ""}
                           </p>
                           <div className="flex flex-wrap items-center gap-2 text-[11px] text-gray-600 dark:text-gray-400 mt-1.5">
-                            <span>Capacity: <strong className="text-gray-900 dark:text-gray-200">{duplicateProject.plantCapacity || "—"} kW</strong></span>
+                            <span>Capacity: <strong className="text-gray-900 dark:text-gray-200">{formatCapacity(duplicateProject.plantCapacity, duplicateProject.capacityUnit || "kW")}</strong></span>
                             <span>•</span>
-                            <span>Historical Scopes: <strong className="text-gray-900 dark:text-gray-200">{toTitleCase(duplicateProject.scopeOfWork || "Pre-Design")}</strong></span>
+                            <span>Historical Scopes: <strong className="text-gray-900 dark:text-gray-200">{formatScopeDisplay(duplicateProject.scopeOfWork || "Pre-Design", scopesData, pricingRules)}</strong></span>
                           </div>
                         </div>
                       </div>
@@ -3132,8 +3735,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     className="w-full p-2 bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs sm:text-sm"
                   >
                     <option value="">-- Choose Scope --</option>
-                    {availableScopes.map(scope => (
-                      <option key={scope} value={scope}>{scope}</option>
+                    {dynamicScopes.map((scope, idx) => (
+                      <option key={`dynamic-scope-${scope}-${idx}`} value={scope}>{scope}</option>
                     ))}
                   </select>
                 </div>
@@ -3146,8 +3749,8 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     className="w-full p-2 bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs sm:text-sm"
                   >
                     <option value="">-- Optional Sub Service --</option>
-                    {availableSubServices.map(sub => (
-                      <option key={sub} value={sub}>{sub}</option>
+                    {availableSubServices.map((sub, idx) => (
+                      <option key={`sub-svc-${sub}-${idx}`} value={sub}>{sub}</option>
                     ))}
                   </select>
                 </div>
@@ -3296,26 +3899,13 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       className="w-full p-2 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs"
                     >
                       <option value="">-- Choose New Scope --</option>
-                      {[
-                        "PVsyst",
-                        "Pre-Design",
-                        "Permit Package",
-                        "Detailed Engineering",
-                        "Single Line Diagram (SLD)",
-                        "Bill of Materials (BOM)",
-                        "CEIG Approvals",
-                        "IFP Package",
-                        "PE Stamping (Civil/Structural)",
-                        "PE Stamping (Electrical)",
-                        "As-Built Drawing",
-                        "Interconnection Study"
-                      ].map((scope) => {
+                      {dynamicScopes.map((scope, sIdx) => {
                         const isHistorical = getAllProjectScopes(upgradeProject).some(
-                          (h) => formatScopeName(h.scope).toLowerCase() === formatScopeName(scope).toLowerCase()
+                          (h) => (h.scope || "").toLowerCase().trim() === scope.toLowerCase().trim()
                         );
                         return (
                           <option 
-                            key={scope} 
+                            key={`modal-dynamic-scope-${scope}-${sIdx}`} 
                             value={scope}
                             disabled={isHistorical}
                           >
@@ -3336,10 +3926,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       onChange={(e) => setSelectedDesignerForScope(e.target.value)}
                       className="w-full p-2 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs"
                     >
-                      {allAssigneesList.map((assignee) => (
-                        <option key={assignee.email} value={assignee.email}>
-                          {assignee.name ? `${assignee.name} (${assignee.email})` : assignee.email}
-                          {normalizeEmail(assignee.email) === normalizeEmail(lockedEmail) ? " (You)" : ""}
+                      {allAssigneesList.map((assignee, aIdx) => (
+                        <option key={`assignee-${assignee.email.toLowerCase().trim()}-${aIdx}`} value={assignee.email}>
+                          {formatDesignerOption(assignee, normalizeEmail(assignee.email) === normalizeEmail(lockedEmail))}
                         </option>
                       ))}
                     </select>
@@ -3365,13 +3954,26 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                       <label className="block text-xs font-medium text-gray-700 dark:text-gray-200 mb-1">
                         Optional Sub-Service / Deliverable Note
                       </label>
-                      <input
-                        type="text"
-                        value={selectedSubServiceForScope}
-                        onChange={(e) => setSelectedSubServiceForScope(e.target.value)}
-                        placeholder="e.g. Revision 1, Inverter Sizing, Fast-track"
-                        className="w-full p-2 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs"
-                      />
+                      {availableUpgradeSubServices.length > 0 ? (
+                        <select
+                          value={selectedSubServiceForScope}
+                          onChange={(e) => setSelectedSubServiceForScope(e.target.value)}
+                          className="w-full p-2 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs"
+                        >
+                          <option value="">-- Optional Sub Service --</option>
+                          {availableUpgradeSubServices.map((sub, idx) => (
+                            <option key={`upgrade-sub-${sub}-${idx}`} value={sub}>{sub}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={selectedSubServiceForScope}
+                          onChange={(e) => setSelectedSubServiceForScope(e.target.value)}
+                          placeholder="e.g. Revision 1, Inverter Sizing, Fast-track"
+                          className="w-full p-2 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md outline-none focus-within:border-[#D4AF37] focus:border-[#D4AF37] text-xs"
+                        />
+                      )}
                     </div>
                     <button
                       type="button"
@@ -3497,9 +4099,9 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                     className="w-full px-3 py-2 bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] text-gray-900 dark:text-white rounded-md focus:ring-0 focus-within:border-[#D4AF37] focus:border-[#D4AF37] outline-none text-xs sm:text-sm"
                   >
                     <option value="">Select a designer...</option>
-                    {designersList.map((designer) => (
-                      <option key={designer.email} value={designer.email}>
-                        {designer.name ? `${designer.name} (${designer.email})` : designer.email}
+                    {designersList.map((designer, dIdx) => (
+                      <option key={`designer-${designer.email.toLowerCase().trim()}-${dIdx}`} value={designer.email}>
+                        {formatDesignerOption(designer)}
                       </option>
                     ))}
                   </select>
@@ -3557,18 +4159,18 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                 </div>
                 <div className="flex justify-between items-center text-xs">
                   <span className="text-gray-500 dark:text-gray-400 font-medium">Plant Capacity:</span>
-                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">{exportProject.plantCapacity ? `${exportProject.plantCapacity} kW` : "TBD"}</span>
+                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">{formatCapacity(exportProject.plantCapacity, exportProject.capacityUnit || "kW")}</span>
                 </div>
                 {(() => {
                   const myScopes = getDesignerAssignedScopes(exportProject, lockedEmail);
-                  const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+                  const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin' || userRole === 'lead_designer';
                   const displayExportScope = isOwnerOrAdmin
                     ? (exportProject.scopeOfWork || "N/A")
                     : (myScopes.length > 0 ? myScopes.join(", ") : (exportProject.scopeOfWork || "N/A"));
                   return (
                     <div className="flex justify-between items-center text-xs">
                       <span className="text-gray-500 dark:text-gray-400 font-medium">Assigned Scope:</span>
-                      <span className="font-semibold text-amber-600 dark:text-[#D4AF37]">{toTitleCase(displayExportScope)}</span>
+                      <span className="font-semibold text-amber-600 dark:text-[#D4AF37]">{formatScopeDisplay(displayExportScope, scopesData, pricingRules)}</span>
                     </div>
                   );
                 })()}

@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth, setPersistence, inMemoryPersistence } from "firebase/auth";
+import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
 const firebaseConfig = {
@@ -14,11 +14,8 @@ const firebaseConfig = {
 // Ensure only one instance of the app is initialized
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 
-// Authentication instance with in-memory persistence (ephemeral session)
+// Authentication instance
 export const auth = getAuth(app);
-if (typeof window !== "undefined") {
-  setPersistence(auth, inMemoryPersistence).catch(() => {});
-}
 
 // Standard initialization targets the true (default) database
 export const db = getFirestore(app);

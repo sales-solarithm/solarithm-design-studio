@@ -2,18 +2,19 @@
 
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { collection, query, where, getDocs, addDoc } from "firebase/firestore";
+import { collection, addDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import {
   SUPER_ADMIN_EMAILS,
-  ALLOWED_ROLES,
   DESIGN_STUDIO_APP_ID,
-  checkHasDesignStudioAccess,
   clearStoredEnterpriseAuth,
-  useAuth
+  useAuth,
+  findCorporateUserRecord,
+  evaluateDesignerAccess
 } from "@/components/AuthGuard";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { Loader2, Mail, AlertCircle, ShieldCheck } from "lucide-react";
+import { COLLECTIONS } from "@/src/config/schema";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -22,7 +23,6 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // If already authenticated in React memory, redirect directly to dashboard
   useEffect(() => {
     if (currentAuthEmail) {
       router.replace("/");
@@ -41,12 +41,12 @@ export default function LoginPage() {
     setError("");
 
     try {
-      // 1. Owner / Super Admin bypass check
+      // 1. Super Admin / Verified Partner bypass check
       const isOwner = SUPER_ADMIN_EMAILS.map((e) => e.toLowerCase()).includes(normalizedEmail);
       if (isOwner) {
-        login(normalizedEmail, "owner");
+        await login(normalizedEmail, "owner", "");
         try {
-          await addDoc(collection(db, "auditLogs"), {
+          await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
             action: "DESIGNER_LOGIN",
             actor: normalizedEmail,
             target: normalizedEmail,
@@ -62,62 +62,47 @@ export default function LoginPage() {
         return;
       }
 
-      // 2. Query 'users' collection in Admin Console
-      const usersQuery = query(
-        collection(db, "users"),
-        where("email", "==", normalizedEmail)
-      );
-      const querySnapshot = await getDocs(usersQuery);
+      // 2. Query both /users and /employees directories (Directive 3)
+      const record = await findCorporateUserRecord(normalizedEmail);
 
-      if (querySnapshot.empty) {
+      if (!record) {
         clearStoredEnterpriseAuth();
         setError(`Access Denied: The email "${normalizedEmail}" was not found in the authorized user roster. Please contact your system administrator.`);
         setLoading(false);
         return;
       }
 
-      // 3. Strict affirmative check for Design Studio access in accessibleApps
-      const userDoc = querySnapshot.docs[0]?.data();
-      const accessibleApps: string[] = Array.isArray(userDoc?.accessibleApps) ? userDoc.accessibleApps : [];
+      // 3. Evaluate designer role eligibility
+      const evalResult = evaluateDesignerAccess(record.userData, normalizedEmail);
 
-      const hasAccess =
-        accessibleApps.includes(DESIGN_STUDIO_APP_ID) ||
-        accessibleApps.includes("design_studio") ||
-        accessibleApps.includes("solarithm_design_studio") ||
-        accessibleApps.includes("design-studio") ||
-        checkHasDesignStudioAccess(accessibleApps);
-
-      if (!hasAccess) {
-        // Deny entry immediately
+      if (!evalResult.isEligible) {
         clearStoredEnterpriseAuth();
-        setError("Access Denied: You do not have permission to access Design Studio.");
+        setError(evalResult.reason || "Access Denied: You do not have permission to access Design Studio.");
         setLoading(false);
         return;
       }
 
-      // 4. Role validation
-      const rawRole = (userDoc?.role || userDoc?.assignedRole || "designer").toLowerCase().trim();
-      if (!ALLOWED_ROLES.includes(rawRole) && rawRole !== "") {
-        clearStoredEnterpriseAuth();
-        setError(`Access Denied: Your account (${normalizedEmail}) does not have authorized Designer, Admin, or Engineering permissions.`);
-        setLoading(false);
-        return;
+      const finalRole = evalResult.resolvedRole;
+      const userDoc = record.userData || {};
+      const officialName = userDoc.name || userDoc.displayName || userDoc.fullName || userDoc.employeeName;
+      if (officialName && typeof window !== "undefined") {
+        localStorage.setItem("solarithm_user_name", officialName.trim());
       }
-
-      const finalRole = rawRole === "owner" || rawRole === "admin" ? rawRole : "designer";
-      login(normalizedEmail, finalRole);
+      await login(normalizedEmail, finalRole, record.userUid, officialName ? officialName.trim() : undefined);
 
       // Audit Log for secure login event
       try {
-        await addDoc(collection(db, "auditLogs"), {
+        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
           action: "DESIGNER_LOGIN",
           actor: normalizedEmail,
           target: normalizedEmail,
           details: {
             role: finalRole,
+            uid: record.userUid,
             app: "Solarithm Design Studio",
             appId: DESIGN_STUDIO_APP_ID,
-            accessibleApps
+            designation: record.userData.designation || "",
+            department: record.userData.department || ""
           },
           timestamp: new Date().toISOString()
         });
@@ -127,7 +112,7 @@ export default function LoginPage() {
     } catch (err: any) {
       console.error("Login verification error:", err);
       clearStoredEnterpriseAuth();
-      setError(err.message || "Failed to verify employee credentials. Please check your connection.");
+      setError(err?.message || "Failed to verify employee credentials. Please check your connection.");
     } finally {
       setLoading(false);
     }
@@ -135,15 +120,12 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex flex-col justify-center items-center bg-gray-50 dark:bg-[#121212] p-4 sm:p-6 transition-colors relative">
-      {/* Top Bar with Theme Toggle */}
       <div className="absolute top-4 right-4 sm:top-6 sm:right-6">
         <ThemeToggle />
       </div>
 
       <div className="w-full max-w-md">
-        {/* Minimal Enterprise Brand Card */}
         <div className="bg-white dark:bg-[#1E1E1E] rounded-2xl shadow-xl border border-gray-200 dark:border-[#333333] p-6 sm:p-8">
-          {/* Logo & Application Title */}
           <div className="text-center mb-6">
             <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-amber-500/10 dark:bg-amber-500/20 border border-amber-500/30 text-[#D4AF37] mb-3">
               <ShieldCheck className="w-6 h-6 text-[#D4AF37]" />
@@ -156,7 +138,6 @@ export default function LoginPage() {
             </p>
           </div>
 
-          {/* Error Message */}
           {error && (
             <div className="mb-5 p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900/50 flex items-start gap-3 text-rose-700 dark:text-rose-400 text-xs sm:text-sm">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -164,22 +145,25 @@ export default function LoginPage() {
             </div>
           )}
 
-          {/* Email-Only Sign In Form */}
           <form onSubmit={handleSignIn} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
-                Email Address
+              <label htmlFor="email" className="block text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-2">
+                Corporate Email
               </label>
               <div className="relative">
-                <Mail className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-400">
+                  <Mail className="h-4 w-4" />
+                </div>
                 <input
+                  id="email"
                   type="email"
                   required
-                  autoComplete="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="designer@solarithm.com"
-                  className="w-full pl-9 pr-3 py-2.5 bg-gray-50 dark:bg-[#2A2A2A] border border-gray-300 dark:border-[#333333] rounded-xl text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] outline-none transition-all"
+                  placeholder="e.g. prathamsolanke.19@solarithmdesign.com"
+                  className="w-full pl-10 pr-4 py-2.5 bg-gray-50 dark:bg-[#252525] border border-gray-300 dark:border-[#404040] rounded-xl text-sm text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#D4AF37] focus:border-transparent transition-all"
+                  autoComplete="email"
+                  autoFocus
                 />
               </div>
             </div>
@@ -187,24 +171,25 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#D4AF37] to-[#B89628] hover:from-[#c5a230] hover:to-[#a78620] text-black font-semibold text-sm transition-all shadow-md hover:shadow-lg disabled:opacity-50 mt-4 cursor-pointer"
+              className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-[#D4AF37] hover:bg-[#B5952F] text-black font-semibold text-sm transition-colors shadow-md disabled:opacity-50 cursor-pointer mt-2"
             >
               {loading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Verifying...
+                  Verifying Designer Credentials...
                 </>
               ) : (
-                "Continue"
+                "Continue to Studio Workspace"
               )}
             </button>
           </form>
-        </div>
 
-        {/* Minimal Footer */}
-        <p className="text-center text-xs text-gray-400 dark:text-gray-500 mt-4">
-          Solarithm Enterprise Cloud Platform &bull; Security Enforced
-        </p>
+          <div className="mt-6 pt-5 border-t border-gray-100 dark:border-[#2C2C2C] text-center">
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Only authorized Solarithm design & engineering personnel may access this workspace.
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );
