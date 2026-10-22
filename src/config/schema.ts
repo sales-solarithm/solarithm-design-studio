@@ -233,18 +233,26 @@ export const resolveProjectDate = (project: any): { timestamp: number; dateObj: 
   const uDate = parseVal(project.updatedAt);
 
   const finalTs = pDate > 0 ? pDate : dDate > 0 ? dDate : cDate > 0 ? cDate : uDate > 0 ? uDate : 0;
-  if (!finalTs) return { timestamp: 0, dateObj: null, formatted: "N/A" };
+  if (!finalTs || isNaN(finalTs) || !Number.isFinite(finalTs) || finalTs <= 0) {
+    return { timestamp: 0, dateObj: null, formatted: "N/A" };
+  }
 
-  const dateObj = new Date(finalTs);
-  if (isNaN(dateObj.getTime())) return { timestamp: 0, dateObj: null, formatted: "N/A" };
+  try {
+    const dateObj = new Date(finalTs);
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return { timestamp: 0, dateObj: null, formatted: "N/A" };
+    }
 
-  const formatted = dateObj.toLocaleDateString('en-IN', {
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric'
-  });
+    const formatted = dateObj.toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric'
+    });
 
-  return { timestamp: finalTs, dateObj, formatted };
+    return { timestamp: finalTs, dateObj, formatted };
+  } catch {
+    return { timestamp: 0, dateObj: null, formatted: "N/A" };
+  }
 };
 
 // Deliverables Validation (DWG, DXF, PDF, ZIP, SLD, PNG, JPG)

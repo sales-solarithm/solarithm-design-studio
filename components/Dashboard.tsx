@@ -141,6 +141,36 @@ const STATUS_LABELS: Record<string, string> = {
   'completed': 'Completed'
 };
 
+export const safeFormatDistanceToNow = (rawDate: any): string => {
+  if (!rawDate) return "Just now";
+  try {
+    let dateObj: Date | null = null;
+    
+    if (typeof rawDate?.toDate === 'function') {
+      dateObj = rawDate.toDate();
+    } else if (typeof rawDate?.toMillis === 'function') {
+      dateObj = new Date(rawDate.toMillis());
+    } else if (typeof rawDate?.seconds === 'number') {
+      dateObj = new Date(rawDate.seconds * 1000);
+    } else if (rawDate instanceof Date) {
+      dateObj = rawDate;
+    } else if (typeof rawDate === 'string' || typeof rawDate === 'number') {
+      const parsed = new Date(rawDate);
+      if (!isNaN(parsed.getTime())) {
+        dateObj = parsed;
+      }
+    }
+    
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return "Recently";
+    }
+    
+    return formatDistanceToNow(dateObj, { addSuffix: true });
+  } catch {
+    return "Recently";
+  }
+};
+
 /**
  * Standardized Date Resolution (PRJ-02):
  * Priority: projectDate -> date -> createdAt -> updatedAt
@@ -150,7 +180,9 @@ export const getProjectDateTimestamp = (project: any): number => {
 };
 
 export const getProjectDateObj = (project: any): Date | null => {
-  return resolveProjectDate(project).dateObj;
+  const d = resolveProjectDate(project).dateObj;
+  if (!d || isNaN(d.getTime())) return null;
+  return d;
 };
 
 // Master engineering taxonomy mapping for known canonical forms and raw database keys
@@ -1497,9 +1529,38 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
         ...doc.data()
       })) as ChangeRequest[];
       
+      const parseCRTime = (raw: any): number => {
+        if (!raw) return 0;
+        try {
+          if (typeof raw?.toMillis === 'function') {
+            const ms = raw.toMillis();
+            return isNaN(ms) ? 0 : ms;
+          }
+          if (typeof raw?.toDate === 'function') {
+            const ms = raw.toDate().getTime();
+            return isNaN(ms) ? 0 : ms;
+          }
+          if (typeof raw?.seconds === 'number') {
+            return isNaN(raw.seconds) ? 0 : raw.seconds * 1000;
+          }
+          if (raw instanceof Date) {
+            const ms = raw.getTime();
+            return isNaN(ms) ? 0 : ms;
+          }
+          if (typeof raw === 'number') {
+            return isNaN(raw) ? 0 : raw;
+          }
+          if (typeof raw === 'string') {
+            const ms = new Date(raw).getTime();
+            return isNaN(ms) ? 0 : ms;
+          }
+        } catch {}
+        return 0;
+      };
+
       crData.sort((a, b) => {
-        const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt instanceof Date ? a.createdAt.getTime() : (a.createdAt ? new Date(a.createdAt).getTime() : 0));
-        const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt instanceof Date ? b.createdAt.getTime() : (b.createdAt ? new Date(b.createdAt).getTime() : 0));
+        const timeA = parseCRTime(a.createdAt);
+        const timeB = parseCRTime(b.createdAt);
         return timeB - timeA;
       });
       
@@ -2889,7 +2950,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                               </button>
                               <div className="text-sm text-gray-500 mt-1 flex items-center gap-1">
                                 <Clock className="w-3 h-3 flex-shrink-0" />
-                                <span className="truncate">{project.updatedAt ? formatDistanceToNow(project.updatedAt.toDate ? project.updatedAt.toDate() : new Date(project.updatedAt), { addSuffix: true }) : 'Just now'}</span>
+                                <span className="truncate">{safeFormatDistanceToNow(project.updatedAt || project.createdAt)}</span>
                               </div>
                             </td>
                             
@@ -2932,7 +2993,7 @@ export function Dashboard({ userRole, lockedEmail, onUnlock }: { userRole?: stri
                               <p className="text-sm text-gray-700 dark:text-gray-200">
                                 {(() => {
                                   const d = getProjectDateObj(project);
-                                  if (!d) return 'N/A';
+                                  if (!d || isNaN(d.getTime())) return 'N/A';
                                   return d.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
                                 })()}
                               </p>
